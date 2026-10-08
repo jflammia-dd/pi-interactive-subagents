@@ -238,7 +238,8 @@ test("a finished worktree's branch reaches the text the orchestrator reads", { s
       { exitCode: 1, elapsed: 5, summary: "", errorMessage: "overloaded" },
     ];
     for (const result of results) {
-      const text = resolveResultPresentation({ ...result, ...fields }, "implementer");
+      // The overlay's resolveResultPresentation returns { content, deliverablePath }.
+      const text = resolveResultPresentation({ ...result, ...fields }, "implementer").content;
       assert.ok(text.includes(`git branch \`${fields.worktreeBranch}\``), text);
       // Before the follow-up hint, which the TUI strips.
       assert.ok(text.indexOf("git branch") < text.indexOf("Follow up with"), text);
@@ -256,7 +257,7 @@ test("a subagent without a worktree gets no branch line", () => {
   // A worktree that is already gone preserved nothing, so claims nothing.
   assert.deepEqual(finishRunningWorktree({ worktreePath: "/nonexistent/path" }), {});
 
-  const text = resolveResultPresentation({ exitCode: 0, elapsed: 5, summary: "done" }, "scout");
+  const text = resolveResultPresentation({ exitCode: 0, elapsed: 5, summary: "done" }, "scout").content;
   assert.doesNotMatch(text, /git branch|worktree/);
 });
 

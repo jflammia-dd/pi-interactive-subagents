@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
+export const TOOL_HANG_THRESHOLD_MS = 600_000; // 10 minutes
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -34,6 +35,7 @@ export type StatusObservation =
       waitingSince?: number;
       latestEvent?: string;
       activityLabel?: string;
+      toolStartedAt?: number;
     }
   | {
       snapshot: "missing" | "invalid" | "wrong-id";
@@ -55,6 +57,7 @@ export interface SubagentStatusState {
   phase: StatusActivityPhase | null;
   latestEvent: string | null;
   activityLabel: string | null;
+  toolStartedAtMs: number | null;
   snapshotState: StatusSnapshotState;
   snapshotProblemSinceMs: number | null;
   snapshotError: string | null;
@@ -253,6 +256,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
+    toolStartedAtMs: null,
     snapshotState: params.source === "claude" ? "unseen" : "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -301,6 +305,7 @@ export function observeStatus(
   const waitingSinceMs = phase === "waiting"
     ? observation.waitingSince ?? state.waitingSinceMs ?? updatedAt
     : null;
+  const toolStartedAtMs = observation.toolStartedAt ?? state.toolStartedAtMs ?? null;
 
   return {
     ...state,
@@ -314,6 +319,7 @@ export function observeStatus(
     phase,
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
+    toolStartedAtMs,
     snapshotState: "present",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -398,10 +404,31 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   let statusLabel: string | null = null;
 
   if (state.snapshotState === "present") {
-    if (state.phase === "active" || state.activeNow) {
+    // Tool-hang detection: if phase is "active" with a tool scope and the tool
+    // has been running longer than TOOL_HANG_THRESHOLD_MS, classify as stalled.
+    if ((state.phase === "active" || state.activeNow) && state.toolStartedAtMs != null) {
+      const toolElapsedMs = Math.max(0, now - state.toolStartedAtMs);
+      if (toolElapsedMs >= TOOL_HANG_THRESHOLD_MS) {
+        kind = "stalled";
+        statusLabel = "tool_hang";
+      } else {
+        kind = "active";
+      }
+    } else if (state.phase === "active" || state.activeNow) {
       kind = "active";
     } else if (state.phase === "waiting") {
-      kind = "waiting";
+      // Waiting-deadlock detection: if phase is "waiting" with no pending
+      // question and no activity for longer than SNAPSHOT_STALLED_AFTER_MS,
+      // classify as stalled.
+      const waitingElapsedMs = state.waitingSinceMs != null
+        ? Math.max(0, now - state.waitingSinceMs)
+        : 0;
+      if (waitingElapsedMs >= SNAPSHOT_STALLED_AFTER_MS && state.latestEvent == null) {
+        kind = "stalled";
+        statusLabel = "waiting_deadlock";
+      } else {
+        kind = "waiting";
+      }
     } else if (state.phase === "done") {
       kind = "waiting";
       statusLabel = "done";
