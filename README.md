@@ -330,6 +330,10 @@ HERDR_ENV=1 HERDR_SESSION=ittest HERDR_PANE_ID=w1:p1 \
 herdr session stop ittest && herdr session delete ittest
 ```
 
+Run individual test files like this during development. The full suite
+(`npm run test:integration`) takes 10+ minutes at `--test-concurrency=1` and
+makes live model calls, so budget for it explicitly.
+
 `test/integration/subagent-lifecycle.test.ts` goes further and drives a real
 pi against a real model, so it additionally needs pi to be authenticated for
 `PI_TEST_MODEL` (default `anthropic/claude-haiku-4-5`). Without that it skips
