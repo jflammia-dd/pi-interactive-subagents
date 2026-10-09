@@ -13,8 +13,8 @@ import {
   rmSync,
   existsSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
+import { join, dirname, resolve } from "node:path";
+import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -173,6 +173,15 @@ function writeAgentFile(
 ) {
   mkdirSync(agentsDir, { recursive: true });
   writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
+}
+
+/** Write the pi model registry the subagent model normalizer reads. */
+function writeModelsFile(globalDir: string, contents: unknown) {
+  mkdirSync(globalDir, { recursive: true });
+  writeFileSync(
+    join(globalDir, "models.json"),
+    typeof contents === "string" ? contents : JSON.stringify(contents, null, 2),
+  );
 }
 
 /** Write the pi settings file a subagent override is read from. */
@@ -1093,7 +1102,7 @@ describe("status.ts", () => {
   it("caps visible status lines and reports overflow consistently", () => {
     const waitingState = observeStatus(
       createStatusState({ source: "pi", startTimeMs: 0 }),
-      { snapshot: "present", updatedAt: 180_000, sequence: 1, phase: "waiting", waitingSince: 180_000 },
+      { snapshot: "present", updatedAt: 180_000, sequence: 1, phase: "waiting", waitingSince: 180_000, latestEvent: "awaiting user response" },
       180_000,
     );
     const activeState = observeStatus(
@@ -1498,6 +1507,69 @@ describe("subagent discovery", () => {
     });
   });
 
+  // `anthropic/claude-opus-5-5` is a bare id that contains a slash: pi reads
+  // `anthropic` as the provider and 401s. The registry fixture mirrors that
+  // shape: one id under two providers, one id under one provider.
+  describe("subagent model normalization", () => {
+    const registry = {
+      providers: {
+        "ai-gw-anthropic-200k": { models: [{ id: "anthropic/claude-opus-5-5" }] },
+        "ai-gw-anthropic-1m": { models: [{ id: "anthropic/claude-opus-5-5" }, { id: "claude-haiku-5-5" }] },
+        "ai-gw-logical": { models: [{ id: "glm-5-3" }] },
+      },
+    };
+
+    function resolveModel(model: string) {
+      return testApi.resolveEffectiveModelAndThinking({ agent: "scout", task: "T", model }, null).model;
+    }
+
+    it("leaves a qualified provider/id ref unchanged", async () => {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeModelsFile(globalDir, registry);
+        assert.equal(
+          resolveModel("ai-gw-anthropic-200k/anthropic/claude-opus-5-5"),
+          "ai-gw-anthropic-200k/anthropic/claude-opus-5-5",
+        );
+        assert.equal(resolveModel("ai-gw-logical/glm-5-3"), "ai-gw-logical/glm-5-3");
+      });
+    });
+
+    it("qualifies a bare id that exactly one provider serves", async () => {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeModelsFile(globalDir, registry);
+        assert.equal(resolveModel("claude-haiku-5-5"), "ai-gw-anthropic-1m/claude-haiku-5-5");
+        assert.equal(resolveModel("glm-5-3"), "ai-gw-logical/glm-5-3");
+      });
+    });
+
+    it("throws on a bare id served by several providers, naming every valid ref", async () => {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeModelsFile(globalDir, registry);
+        assert.throws(
+          () => resolveModel("anthropic/claude-opus-5-5"),
+          (err: Error) =>
+            err.message.includes('Subagent model "anthropic/claude-opus-5-5" is ambiguous') &&
+            err.message.includes("ai-gw-anthropic-200k/anthropic/claude-opus-5-5") &&
+            err.message.includes("ai-gw-anthropic-1m/anthropic/claude-opus-5-5"),
+        );
+      });
+    });
+
+    it("passes an unknown string through unchanged, so built-in models keep working", async () => {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeModelsFile(globalDir, registry);
+        assert.equal(resolveModel("anthropic/pinned"), "anthropic/pinned");
+      });
+    });
+
+    it("passes the model through unchanged when models.json is unreadable", async () => {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeModelsFile(globalDir, "{ not json");
+        assert.equal(resolveModel("claude-haiku-5-5"), "claude-haiku-5-5");
+      });
+    });
+  });
+
   it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
     for (const name of ["scout", "researcher", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
@@ -1538,28 +1610,98 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+  it("getToolExtensionSpecifiers maps custom tools and skips built-ins", async () => {
+    assert.deepEqual(testApi.getToolExtensionSpecifiers("read"), []);
+    assert.deepEqual(testApi.getToolExtensionSpecifiers("bash"), []);
+    assert.ok(testApi.getToolExtensionSpecifiers("safe_bash")?.[0]?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    assert.ok(testApi.getToolExtensionSpecifiers("subagent")?.[0]?.endsWith("index.ts"));
 
-    // A bundled tool extension resolves only when it is installed on disk, so
-    // isolate PI_CODING_AGENT_DIR rather than asserting against whatever the
-    // developer happens to have in ~/.pi/agent/extensions.
+    // The web tools moved out of `~/.pi/agent/extensions/{web-search,web-fetch}`
+    // into the `research-web` package, wired into pi via settings.json as
+    // `../../dd/datadog-pi-packages/packages/research-web` (relative to the
+    // agent config dir). The resolver points at the same file, so isolate
+    // PI_CODING_AGENT_DIR and create that exact path on disk.
     await withIsolatedAgentEnv(({ globalDir }) => {
-      assert.equal(
-        testApi.getToolExtensionPath("web_search"),
-        undefined,
+      const researchWebExt = resolve(
+        globalDir,
+        "../../dd/datadog-pi-packages/packages/research-web/extensions/research-web/index.ts",
+      );
+      assert.deepEqual(
+        testApi.getToolExtensionSpecifiers("web_search"),
+        [],
         "an uninstalled tool extension should not resolve",
       );
 
-      const installed = join(globalDir, "extensions", "web-search", "index.ts");
-      mkdirSync(dirname(installed), { recursive: true });
-      writeFileSync(installed, "export default {};\n");
-      assert.equal(testApi.getToolExtensionPath("web_search"), installed);
+      mkdirSync(dirname(researchWebExt), { recursive: true });
+      writeFileSync(researchWebExt, "export default {};\n");
+      try {
+        assert.equal(testApi.getToolExtensionSpecifiers("web_search")[0], researchWebExt);
+      } finally {
+        // Clean up only the dd tree we created above globalDir. Do NOT use
+        // resolve(globalDir, "../../dd") which escapes the temp root and
+        // could resolve to ~/dd if agent-dir isolation is absent.
+        const ddRoot = resolve(globalDir, "../../dd");
+        if (ddRoot.startsWith(tmpdir()) && ddRoot !== homedir()) {
+          rmSync(ddRoot, { recursive: true, force: true });
+        }
+      }
     });
+  });
+
+  it("overlay and tests never contain the truncated codemode builtin typo", () => {
+    // Every historical 'Unknown built-in extension' failure came from a
+    // truncated specifier, never from builtin:codemode itself. The typo is
+    // built by concatenation so this file does not match its own check; the
+    // bare string is never a substring of 'codemode', so the grep is safe.
+    // Case-insensitive so a capitalized variant cannot slip through.
+    const typo = "code" + "me";
+    const here = dirname(fileURLToPath(import.meta.url));
+    for (const rel of ["../pi-extension/subagents/index.ts", "test.ts"]) {
+      const src = readFileSync(resolve(here, rel), "utf8");
+      assert.ok(!src.toLowerCase().includes(typo), `${rel} contains the '${typo}' typo`);
+    }
+  });
+
+  it("getToolExtensionSpecifiers resolves MCP tool names to the mcp and codemode builtins", async () => {
+    // The namespaced `mcp__<server>__<tool>` form, the bare `mcp` legacy name
+    // and `codemode` all need pi's built-in MCP support, which `--no-extensions`
+    // otherwise drops in restricted subagent panes. The resolver points those
+    // names at the mcp and codemode builtins so applySandboxToParts can
+    // re-load them via `-e` (native specifiers, verified resolving on pi 1.1.0).
+    await withIsolatedAgentEnv(() => {
+      const specs = testApi.getToolExtensionSpecifiers("mcp__atlassian__addCommentToJiraIssue");
+      assert.equal(specs[0], "builtin:mcp", "MCP tool names should load the mcp builtin");
+      assert.equal(
+        specs[1],
+        "builtin:codemode",
+        "MCP tool names should load the codemode builtin",
+      );
+      assert.equal(specs.length, 2, "exactly the mcp and codemode builtins are expected");
+      assert.deepEqual(
+        testApi.getToolExtensionSpecifiers("mcp"),
+        specs,
+        "the bare legacy mcp name should resolve to the same specifiers",
+      );
+      assert.deepEqual(
+        testApi.getToolExtensionSpecifiers("codemode"),
+        specs,
+        "codemode should resolve to the same specifiers",
+      );
+      assert.deepEqual(
+        testApi.getToolExtensionSpecifiers("mcp__atlassian__*"),
+        specs,
+        "the native mcp__* glob (what the legacy mcp alias translates to) should resolve to the same specifiers",
+      );
+      assert.deepEqual(
+        testApi.getToolExtensionSpecifiers("tool_search"),
+        ["builtin:tool-search", "builtin:mcp"],
+        "tool_search should resolve to the built-in tool-search and MCP extensions",
+      );
+    });
+
+    // A non-MCP unknown name still resolves to nothing.
+    assert.deepEqual(testApi.getToolExtensionSpecifiers("not_a_real_tool"), []);
   });
 
   it("reads pane-placement from an agent definition", async () => {
@@ -1659,6 +1801,24 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("buildSubagentToolAllowlist translates the legacy mcp alias to the native mcp__* glob", () => {
+    // Pi 1.0.4+ `--tools` natively filters MCP tools with `mcp__`-prefixed
+    // glob entries. The legacy `mcp` name (the retired pi-mcp-adapter proxy
+    // tool) matched no tool the child registers, so it loaded the MCP
+    // extensions but declared nothing. The builder now emits the native glob
+    // so an un-migrated agent definition listing `tools: ..., mcp` gets the
+    // whole MCP surface declared.
+    assert.equal(
+      testApi.buildSubagentToolAllowlist("read,mcp"),
+      "read,mcp__*,ask_question",
+    );
+    // Native glob entries pass through untouched (no double translation).
+    assert.equal(
+      testApi.buildSubagentToolAllowlist("read,mcp__odp__*"),
+      "read,mcp__odp__*,ask_question",
+    );
+  });
+
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
@@ -1698,6 +1858,92 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts re-loads the built-in MCP extensions via -e when an MCP tool is granted", async () => {
+    // --no-extensions drops global discovery, so the built-in MCP support
+    // (which registers every MCP tool) would never load in a restricted
+    // subagent pane. Listing an MCP tool in the allowlist must cause
+    // applySandboxToParts to emit `-e builtin:mcp` plus `-e builtin:codemode`
+    // (native specifiers, verified resolving on pi 1.1.0) so the tools
+    // actually register.
+    await withIsolatedAgentEnv(() => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          {
+            agent: "worker",
+            toolAllowlist: "read,bash,mcp__atlassian__addCommentToJiraIssue",
+            model: null,
+            thinking: null,
+            systemPromptMode: null,
+            identity: null,
+            spawnable: [],
+            autoExit: true,
+            cwd: null,
+            agentDir: null,
+          },
+          { artifactDir: d, name: "worker" },
+        );
+        assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+        const eIdx = parts.indexOf("-e");
+        assert.ok(eIdx >= 0, "expected at least one -e flag for the built-in MCP support");
+        // The -e value is shell-escaped (single-quoted), so match it as a
+        // substring the way the sibling allowlist test does.
+        assert.ok(
+          parts.some((p) => p.includes("builtin:mcp")),
+          "expected the builtin:mcp specifier among the -e flags",
+        );
+        assert.ok(
+          parts.some((p) => p.includes("builtin:codemode")),
+          "expected the builtin:codemode specifier among the -e flags",
+        );
+      });
+    });
+  });
+
+  it("applySandboxToParts declares the native mcp__* glob and still loads the MCP extensions", async () => {
+    // The translated legacy allowlist (`tools: read,mcp` → `read,mcp__*,ask_question`)
+    // must work end to end: the glob is handed to `--tools` verbatim (pi filters
+    // MCP tools natively) and still resolves to `-e builtin:mcp` plus
+    // `-e builtin:codemode`, exactly like a concrete `mcp__<server>__<tool>` entry.
+    await withIsolatedAgentEnv(() => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          {
+            agent: "worker",
+            toolAllowlist: "read,mcp__*,ask_question",
+            model: null,
+            thinking: null,
+            systemPromptMode: null,
+            identity: null,
+            spawnable: [],
+            autoExit: true,
+            cwd: null,
+            agentDir: null,
+          },
+          { artifactDir: d, name: "worker" },
+        );
+        assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+        const toolsIdx = parts.indexOf("--tools");
+        assert.ok(toolsIdx >= 0, "expected --tools");
+        assert.ok(
+          parts[toolsIdx + 1].includes("mcp__*"),
+          "expected the native mcp__* glob as part of the --tools value",
+        );
+        assert.ok(
+          parts.some((p) => p.includes("builtin:mcp")),
+          "expected the builtin:mcp specifier among the -e flags",
+        );
+        assert.ok(
+          parts.some((p) => p.includes("builtin:codemode")),
+          "expected the builtin:codemode specifier among the -e flags",
+        );
+      });
     });
   });
 
@@ -2866,7 +3112,8 @@ describe("subagent interruption", () => {
         structuredOutputError: "value: expected object, got string",
       },
       "scout",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
 
     assert.match(presentation, /WARNING: this agent declares an output-schema/);
     assert.match(presentation, /expected object, got string/);
@@ -2882,7 +3129,8 @@ describe("subagent interruption", () => {
     const presentation = testApi.resolveResultPresentation(
       { exitCode: 0, elapsed: 30, summary: "Looks fine to me." },
       "scout",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
     assert.doesNotMatch(presentation, /output-schema/);
   });
 
@@ -2895,7 +3143,8 @@ describe("subagent interruption", () => {
     const presentation = testApi.resolveResultPresentation(
       { exitCode: 0, elapsed: 42, summary: forged },
       "scout",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
 
     assert.match(presentation, /BEGIN SUBAGENT OUTPUT \(untrusted/);
     assert.match(presentation, /END SUBAGENT OUTPUT/);
@@ -2919,7 +3168,8 @@ describe("subagent interruption", () => {
         sessionId: "019f-abc",
       },
       "Worker",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
@@ -2945,7 +3195,8 @@ describe("subagent interruption", () => {
         errorMessage: "Anthropic 529 Overloaded after 3 retries",
       },
       "Worker",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
@@ -3941,7 +4192,8 @@ describe("fixes the review found untested", () => {
     const presentation = testApi.resolveResultPresentation(
       { exitCode: 0, elapsed: 5, summary: forged },
       "scout",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
 
     const closes = presentation.split("--- END SUBAGENT OUTPUT ---").length - 1;
     assert.equal(closes, 1, "the child must not be able to close the fence itself");
@@ -4048,7 +4300,8 @@ describe("fixes the review found untested", () => {
     const presentation = testApi.resolveResultPresentation(
       { exitCode: 1, elapsed: 3, summary: "Sub-agent exited with code 1" },
       "scout",
-    );
+      join(tmpdir(), "pi-sub-test-deliverables"),
+    ).content;
     assert.doesNotMatch(presentation, /output-schema/);
   });
 });
@@ -4453,6 +4706,132 @@ describe("gaps the mutation sweep exposed", () => {
       rebalanceInFlight.clear();
       rebalanceRerun.clear();
     }
+  });
+});
+
+describe("model resolution on the retry and batch paths", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("collapses a bare id to its provider before choosing a retry fallback", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, {
+        providers: {
+          "ai-gw-one": { models: [{ id: "shared/model-x" }] },
+          "ai-gw-two": { models: [{ id: "other-model" }] },
+        },
+      });
+      // Unnormalized, `shared` would read as the provider, so the fallback
+      // would be ai-gw-one/shared/model-x: the very model that just failed.
+      assert.equal(
+        testApi.pickRetryFallbackModel(
+          { name: "s", agent: "scout" },
+          { agent: "scout", task: "T", model: "shared/model-x" },
+        ),
+        "ai-gw-two/other-model",
+      );
+    });
+  });
+
+  it("skips the retry, without throwing, when the model became ambiguous after launch", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, {
+        providers: {
+          "p-a": { models: [{ id: "dup" }] },
+          "p-b": { models: [{ id: "dup" }] },
+        },
+      });
+      const logged: string[] = [];
+      const realError = console.error;
+      console.error = (...args: unknown[]) => logged.push(args.map(String).join(" "));
+      try {
+        assert.equal(
+          testApi.pickRetryFallbackModel(
+            { name: "s", agent: "scout" },
+            { agent: "scout", task: "T", model: "dup" },
+          ),
+          undefined,
+        );
+      } finally {
+        console.error = realError;
+      }
+      assert.match(logged.join("\n"), /will not retry.*ambiguous/);
+    });
+  });
+
+  it("treats one provider listing the same id twice as unambiguous", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, {
+        providers: { "p-only": { models: [{ id: "twice" }, { id: "twice" }] } },
+      });
+      assert.equal(
+        testApi.resolveEffectiveModelAndThinking({ agent: "scout", task: "T", model: "twice" }, null).model,
+        "p-only/twice",
+      );
+    });
+  });
+
+  it("refuses an ambiguous model on any task before the first task launches", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "scout", "name: scout\ndescription: test scout");
+      writeModelsFile(globalDir, {
+        providers: {
+          "p-one": { models: [{ id: "solo" }] },
+          "p-a": { models: [{ id: "dup" }] },
+          "p-b": { models: [{ id: "dup" }] },
+        },
+      });
+      // A fake herdr that logs every call. A launch always starts by calling
+      // herdr, so an absent log proves that no task launched.
+      const binDir = join(globalDir, "bin");
+      mkdirSync(binDir, { recursive: true });
+      const herdrLog = join(globalDir, "herdr-calls.log");
+      writeFileSync(join(binDir, "herdr"), `#!/bin/sh\necho "$@" >> "${herdrLog}"\nexit 1\n`, {
+        mode: 0o755,
+      });
+
+      const savedHerdrEnv = process.env.HERDR_ENV;
+      const savedPath = process.env.PATH;
+      process.env.HERDR_ENV = "1";
+      process.env.PATH = `${binDir}:${savedPath ?? ""}`;
+      try {
+        const { api, registeredTools, sentMessages } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const tool = registeredTools.find((t) => t.name === "subagent_parallel");
+        assert.ok(tool, "expected subagent_parallel to be registered");
+
+        const ctx = {
+          cwd: projectDir,
+          sessionManager: {
+            getSessionFile: () => join(globalDir, "parent.jsonl"),
+            getSessionId: () => "sess-batch",
+            getSessionDir: () => globalDir,
+          },
+        };
+        const result = await tool.execute(
+          "call-batch",
+          {
+            tasks: [
+              { key: "first", agent: "scout", task: "T", name: "first", model: "solo" },
+              { key: "second", agent: "scout", task: "T", name: "second", model: "dup" },
+            ],
+          },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+        const text = result.content[0].text;
+        assert.match(text, /Task "second" \(agent "scout"\)/, "the error must name the task");
+        assert.match(text, /ambiguous/);
+        assert.match(text, /p-a\/dup, p-b\/dup/, "the error must list the valid refs");
+        assert.doesNotMatch(text, /Spawned/);
+        assert.equal(existsSync(herdrLog), false, "no task may reach herdr: the batch aborts first");
+        assert.deepEqual(sentMessages, []);
+      } finally {
+        restoreEnvVar("HERDR_ENV", savedHerdrEnv);
+        restoreEnvVar("PATH", savedPath);
+      }
+    });
   });
 });
 
