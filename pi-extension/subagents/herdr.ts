@@ -136,6 +136,159 @@ function herdrApi(method: string, params: unknown): Promise<any> {
   });
 }
 
+// ── Event subscription (optional, low-latency status path) ──
+
+/**
+ * One agent-status change observed for a pane. `raw` is the event payload as
+ * herdr sent it, for callers that want fields beyond `agent`/`state`.
+ */
+export interface AgentStatusEvent {
+  paneId: string;
+  agent?: string;
+  state?: string;
+  raw: unknown;
+}
+
+/** Handle returned by `subscribeAgentStatus`; call `unsubscribe()` to stop. */
+export interface AgentStatusSubscription {
+  unsubscribe(): void;
+}
+
+/**
+ * Long-lived subscription to a pane's agent-status changes via herdr's
+ * `events.subscribe` socket method. The server streams newline-delimited JSON
+ * events over a single connection; each event whose type is
+ * `pane.agent_status_changed` is forwarded to `onStatusChange`.
+ *
+ * This is an OPTIONAL enhancement over the CLI-based polling in index.ts, which
+ * remains the source of truth. Callers may use this for lower-latency status
+ * transitions without a poll interval; nothing currently wires it in, so the
+ * poll loop keeps working unchanged if the socket path is unavailable.
+ *
+ * Error recovery: herdr signals lost events with an `events_lost` error. On
+ * that signal we resubscribe and reconcile the gap via `session.snapshot`, so
+ * a status change that happened during the disconnect is still observed. A
+ * dropped connection (herdr restart) is reconnected on a backoff.
+ *
+ * Returns an inert subscription when `HERDR_SOCKET_PATH` is unset, so callers
+ * do not need to guard for its absence.
+ */
+export function subscribeAgentStatus(
+  paneId: string,
+  onStatusChange: (event: AgentStatusEvent) => void,
+): AgentStatusSubscription {
+  const socketPath = process.env.HERDR_SOCKET_PATH;
+  let closed = false;
+  let sock: ReturnType<typeof connect> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let buf = "";
+
+  const reconcile = async (): Promise<void> => {
+    try {
+      const snap = await herdrApi("session.snapshot", {});
+      const panes: any[] =
+        (snap as any)?.panes ?? (snap as any)?.result?.panes ?? [];
+      const me = panes.find((p: any) => p.pane_id === paneId);
+      if (me) {
+        onStatusChange({
+          paneId,
+          agent: me.agent ?? me.agent_label,
+          state: me.agent_state ?? me.state,
+          raw: me,
+        });
+      }
+    } catch {
+      // Best-effort reconciliation; a failed snapshot must not disturb callers.
+    }
+  };
+
+  const open = (): void => {
+    if (closed || !socketPath) return;
+    let s: ReturnType<typeof connect>;
+    try {
+      s = connect(socketEndpoint(socketPath));
+    } catch {
+      if (!closed) reconnectTimer = setTimeout(open, 2000);
+      return;
+    }
+    sock = s;
+    // A subscription socket sits idle between events; disable the inactivity
+    // timeout that `herdrApi` uses for one-shot requests.
+    s.setTimeout(0);
+    s.on("error", () => {
+      sock = null;
+      if (!closed) reconnectTimer = setTimeout(open, 2000);
+    });
+    s.on("close", () => {
+      sock = null;
+      if (!closed) reconnectTimer = setTimeout(open, 2000);
+    });
+    s.on("connect", () => {
+      s.write(
+        JSON.stringify({
+          id: "pi-events",
+          method: "events.subscribe",
+          params: { events: ["pane.agent_status_changed"], pane_id: paneId },
+        }) + "\n",
+      );
+    });
+    s.on("data", (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg: any;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        // `events_lost`: we missed events during a disconnect. Resubscribe and
+        // reconcile the gap via session.snapshot so nothing is silently dropped.
+        if (
+          msg?.error?.code === "events_lost" ||
+          /events_lost/i.test(String(msg?.error?.message ?? ""))
+        ) {
+          try { s.end(); } catch {}
+          void reconcile();
+          if (!closed) reconnectTimer = setTimeout(open, 100);
+          return;
+        }
+        const evt = msg?.result?.event ?? msg?.event ?? msg?.result;
+        if (
+          evt &&
+          (evt.type === "pane.agent_status_changed" ||
+            evt.event === "pane.agent_status_changed")
+        ) {
+          onStatusChange({
+            paneId: evt.pane_id ?? paneId,
+            agent: evt.agent ?? evt.agent_label,
+            state: evt.state ?? evt.agent_state,
+            raw: evt,
+          });
+        }
+      }
+    });
+  };
+
+  if (!socketPath) {
+    return { unsubscribe() { closed = true; } };
+  }
+
+  open();
+
+  return {
+    unsubscribe() {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { sock?.end(); } catch {}
+      try { sock?.destroy(); } catch {}
+    },
+  };
+}
+
 /** A node of the BSP tree returned by `layout.export`. */
 export type LayoutNode =
   | { type: "pane"; pane_id?: string }
