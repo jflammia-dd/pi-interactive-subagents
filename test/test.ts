@@ -2650,7 +2650,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes a debloated schema: agent+task required, name/model/cwd/maxMs optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2660,8 +2660,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "maxMs", "model", "name", "task"],
+      "only agent/task/name/model/cwd/maxMs should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -4581,6 +4581,81 @@ describe("pollForExit is bounded and reports a vanished pane", () => {
     assert.equal(gone("", new Error("herdr socket timed out")), false);
     assert.equal(gone("", new Error("connection refused")), false);
     assert.equal(gone("", null), false, "a clean no-match must re-arm, not give up");
+  });
+});
+
+describe("per-dispatch maxMs bounds the watcher", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  /** A RunningSubagent shaped for watchSubagent, pointed at surfaces that never complete. */
+  function fakeRunning(overrides: Partial<any> = {}): any {
+    const dir = mkdtempSync(join(tmpdir(), "maxms-"));
+    return {
+      id: "maxms-probe",
+      name: "maxms-probe",
+      task: "probe",
+      surface: "w99:p99",
+      startTime: Date.now(),
+      sessionFile: join(dir, "never-written.jsonl"),
+      statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      interactive: false,
+      ...overrides,
+    };
+  }
+
+  it("an explicit params.maxMs bounds the watch instead of the six-hour default", async () => {
+    // With a vanished pane, pollForExit's pane-gone path reports at ~2s. The
+    // assertion that the watch TERMINATES at test scale is the point: a
+    // dropped param would fall back to the six-hour default and hang until
+    // the test runner's own timeout fires.
+    const running = fakeRunning({ maxMs: 50 });
+    const started = Date.now();
+    try {
+      const result = await testApi.watchSubagent(running, new AbortController().signal);
+      assert.ok(Date.now() - started < 60_000, "watch did not honor the explicit maxMs");
+      assert.ok(result.errorMessage, "expected a bounded-watch report");
+    } finally {
+      testApi.runningSubagents.delete(running.id);
+      rmSync(dirname(running.sessionFile), { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to PI_SUBAGENT_MAX_MS when the param is absent", async () => {
+    const previous = process.env.PI_SUBAGENT_MAX_MS;
+    process.env.PI_SUBAGENT_MAX_MS = "50";
+    const running = fakeRunning();
+    const started = Date.now();
+    try {
+      const result = await testApi.watchSubagent(running, new AbortController().signal);
+      assert.ok(Date.now() - started < 60_000, "watch did not honor the env var fallback");
+      assert.ok(result.errorMessage, "expected a bounded-watch report");
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_MAX_MS", previous);
+      testApi.runningSubagents.delete(running.id);
+      rmSync(dirname(running.sessionFile), { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid maxMs values in favor of the env var, then the default", () => {
+    const resolve = testApi.resolveDispatchMaxMs;
+    const previous = process.env.PI_SUBAGENT_MAX_MS;
+    try {
+      // With no env var, invalid params fall through to the six-hour default.
+      delete process.env.PI_SUBAGENT_MAX_MS;
+      const sixHours = 6 * 60 * 60 * 1000;
+      for (const bad of [0, -5, 999, 1.5, Number.NaN]) {
+        assert.equal(resolve(bad), sixHours, `expected ${bad} to be ignored`);
+      }
+      assert.equal(resolve(undefined), sixHours);
+
+      // A valid explicit param wins over the env var...
+      process.env.PI_SUBAGENT_MAX_MS = "5000";
+      assert.equal(resolve(2700000), 2700000);
+      // ...and an invalid one falls back to it.
+      assert.equal(resolve(500), 5000, "a sub-1000 value is a unit mistake, not a bound");
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_MAX_MS", previous);
+    }
   });
 });
 

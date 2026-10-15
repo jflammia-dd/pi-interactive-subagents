@@ -125,6 +125,15 @@ const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+  maxMs: Type.Optional(
+    Type.Number({
+      description:
+        "Optional watcher bound for this dispatch in milliseconds. Bounds how long the parent watches " +
+        "this subagent before reporting it as still-running; use 2700000 (45 minutes) or 3600000 " +
+        "(60 minutes) for verification/adversarial fleets. Defaults to PI_SUBAGENT_MAX_MS, then the " +
+        "6-hour fork default. The expiry is non-killing: the pane and worktree remain for manual steering.",
+    }),
+  ),
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -737,6 +746,22 @@ function getSubagentMaxMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 6 * 60 * 60 * 1000;
 }
 
+/**
+ * Resolve the watcher bound for ONE dispatch: an explicit params.maxMs wins,
+ * then PI_SUBAGENT_MAX_MS (via getSubagentMaxMs), then the six-hour fork
+ * default. A bash export mid-session cannot reach the pi process env, which is
+ * why the per-dispatch param exists. Values below 1000 are rejected as likely
+ * unit mistakes (seconds passed as milliseconds), as are zero, negative and
+ * non-integer values: an invalid param is ignored, falling back to the env var
+ * / default, rather than failing the spawn.
+ */
+function resolveDispatchMaxMs(explicit: number | undefined): number {
+  if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 1000) {
+    return explicit;
+  }
+  return getSubagentMaxMs();
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -975,6 +1000,12 @@ interface RunningSubagent {
   worktreePath?: string;
   /** JSON Schema for structured output validation, if the agent declares one. */
   outputSchema?: unknown;
+  /**
+   * Watcher bound for this dispatch in milliseconds, from params.maxMs. When
+   * absent (or invalid), watchSubagent falls back to PI_SUBAGENT_MAX_MS, then
+   * the six-hour default — see resolveDispatchMaxMs.
+   */
+  maxMs?: number;
   /**
    * Session lines written by the seed, not by the child. Only non-zero for a
    * `fork` spawn, whose seed carries the parent's own assistant messages.
@@ -1733,6 +1764,7 @@ export const __test__ = {
   claudeFinalMessage,
   cliLaunchWords,
   findBatchSpawnProblem,
+  resolveDispatchMaxMs,
   pickRetryFallbackModel,
   isTransientProviderError,
   applySandboxToParts,
@@ -1979,6 +2011,7 @@ async function launchSubagentInner(
       }),
       ...(worktreePath ? { worktreePath } : {}),
       ...(agentDefs.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
+      ...(params.maxMs !== undefined ? { maxMs: params.maxMs } : {}),
     };
 
     runningSubagents.set(id, running);
@@ -2125,6 +2158,7 @@ async function launchSubagentInner(
     }),
     ...(worktreePath ? { worktreePath } : {}),
     ...(agentDefs?.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
+    ...(params.maxMs !== undefined ? { maxMs: params.maxMs } : {}),
     ...(seededLines > 0 ? { seededLines } : {}),
   };
 
@@ -2446,7 +2480,7 @@ async function watchSubagent(
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       doneId: running.id,
-      maxMs: getSubagentMaxMs(),
+      maxMs: resolveDispatchMaxMs(running.maxMs),
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
@@ -3378,6 +3412,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Spawn multiple subagents in parallel. Each runs in its own pane with its own task. " +
         "Results are delivered individually as steer messages as each subagent finishes — " +
         "you do NOT need to poll or wait. Pass a `tasks` array of { key, agent, task, name } objects. " +
+        "Each task may set an optional maxMs (milliseconds) to bound the watcher for that dispatch " +
+        "(e.g. 2700000 for 45 minutes); the expiry is non-killing. " +
         "Optionally set `worktree: true` to give each subagent its own git worktree (recommended " +
         "for agents that edit files, to avoid conflicts). Returns immediately with the list of " +
         "launched subagent names.",
@@ -3393,6 +3429,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: Type.String({ description: "The subagent_message resolution handle. Canonicalized to [a-z][a-z0-9_-]{0,31}. This is how other agents find and address this agent. Required." }),
             model: Type.Optional(Type.String({ description: "Model override." })),
             cwd: Type.Optional(Type.String({ description: "Working directory override." })),
+            maxMs: Type.Optional(Type.Number({ description: "Optional watcher bound for this dispatch in milliseconds (e.g. 2700000 for 45 minutes). Defaults to PI_SUBAGENT_MAX_MS, then the 6-hour fork default. Non-killing: the pane and worktree remain." })),
           }),
         ),
         worktree: Type.Optional(
@@ -3471,7 +3508,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
           try {
             // `worktree: true` on the batch overrides each agent's own setting.
-            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd };
+            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd, maxMs: t.maxMs };
             const running = await launchSubagent(
               taskParams,
               ctx,
