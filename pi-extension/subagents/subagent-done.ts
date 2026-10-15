@@ -15,6 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { execFileSync } from "node:child_process";
 import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
@@ -108,6 +109,49 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+}
+
+/**
+ * An aborted run (the user pressed Esc in this pane) surfaces as a
+ * stopReason "error" turn whose errorMessage mentions an abort. Distinct
+ * from genuine provider failures (503s, timeouts), which must not be
+ * reported as cancellations.
+ */
+export function isAbortedError(errorMessage: string | undefined): boolean {
+  return !!errorMessage && /abort/i.test(errorMessage);
+}
+
+/**
+ * Report this pane's aborted run to herdr as idle with a "cancelled"
+ * message, from inside the child while it is still alive. The parent's own
+ * report always arrives after herdr has already dropped the pane's agent
+ * (the child process exits first), so only the child can land the
+ * distinction. Uses a source distinct from the parent's
+ * ("custom:pi-subagents") so herdr's per-source sequence tracking cannot
+ * discard the report as stale. Best-effort: a failed report must never
+ * disturb the shutdown.
+ */
+let childReportSeq = 0;
+export function reportCancelledToHerdr(): void {
+  const paneId = process.env.HERDR_PANE_ID;
+  const name = process.env.PI_SUBAGENT_NAME;
+  if (process.env.HERDR_ENV !== "1" || !paneId || !name) return;
+  try {
+    execFileSync(
+      "herdr",
+      [
+        "pane", "report-agent", paneId,
+        "--source", "custom:pi-subagents-child",
+        "--agent", name,
+        "--state", "idle",
+        "--seq", String(++childReportSeq),
+        "--message", "cancelled",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "ignore", "ignore"] },
+    );
+  } catch {
+    // Best effort — herdr may be absent or the pane already gone.
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -263,6 +307,13 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // A user abort (Esc in this pane) settles the pane at idle with a
+      // "cancelled" message so herdr distinguishes it from a clean finish.
+      // Reported from inside the child because the parent's report races
+      // herdr's own process-exit detection and always loses.
+      if (errorInfo && isAbortedError(errorInfo.errorMessage)) {
+        reportCancelledToHerdr();
+      }
       recorder.agentEndDone();
       ctx.shutdown();
       return;

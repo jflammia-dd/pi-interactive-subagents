@@ -1305,10 +1305,10 @@ function syncHerdrAgentState(running: RunningSubagent, observedAt: number): void
 }
 
 /** Settle the pane at idle and hand lifecycle authority back to herdr. */
-function finishHerdrAgentState(running: RunningSubagent): void {
+function finishHerdrAgentState(running: RunningSubagent, message?: string): void {
   if (running.cli === "claude") return;
   if (running.herdrState && running.herdrState !== "idle") {
-    reportAgentState(running.surface, running.name, "idle");
+    reportAgentState(running.surface, running.name, "idle", message);
   }
   running.herdrState = undefined;
   releaseAgentState(running.surface, running.name);
@@ -1734,6 +1734,7 @@ export const __test__ = {
   cliLaunchWords,
   findBatchSpawnProblem,
   pickRetryFallbackModel,
+  isTransientProviderError,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -2289,10 +2290,13 @@ type SubagentSpawnCtx = {
 /**
  * Provider/network failures worth one retry. Auth errors (401/403) and
  * anything else are NOT transient: retrying them with a different model would
- * either fail the same way or paper over a real permission problem.
+ * either fail the same way or paper over a real permission problem. Aborts
+ * ("This operation was aborted") are deliberately excluded: in a subagent
+ * pane that string is almost always the user pressing Esc to cancel the run,
+ * and retrying a user cancellation ignores their intent.
  */
 const TRANSIENT_ERROR_RE =
-  /502|503|service unavailable|overload|auto-retry exhausted|This operation was aborted/i;
+  /502|503|service unavailable|overload|auto-retry exhausted/i;
 
 function isTransientProviderError(errorMessage: string | undefined): boolean {
   return !!errorMessage && TRANSIENT_ERROR_RE.test(errorMessage);
@@ -2319,11 +2323,53 @@ function effectiveModelForRetry(
 }
 
 /**
+ * Load the enabledModels patterns from pi's settings.json. When the setting
+ * is present, retry fallbacks are restricted to models the user enabled: an
+ * arbitrary catalog entry can be an image or other non-chat model (the
+ * ai-gw-openai catalog leads with an image model that declares the
+ * openai-completions api), which cannot serve a subagent chat session.
+ * Returns undefined when the setting is absent or empty, leaving the
+ * fallback unfiltered for setups that do not curate it.
+ */
+function loadEnabledModelPatterns(): string[] | undefined {
+  try {
+    const settingsPath = join(getAgentConfigDir(), "settings.json");
+    if (!existsSync(settingsPath)) return undefined;
+    const parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
+    const enabled = (parsed as { enabledModels?: unknown } | null)?.enabledModels;
+    if (!Array.isArray(enabled) || enabled.length === 0) return undefined;
+    const patterns = enabled.filter((p): p is string => typeof p === "string" && p.length > 0);
+    return patterns.length > 0 ? patterns : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Glob-match a `<provider>/<id>` ref against an enabledModels pattern. */
+function matchesEnabledPattern(ref: string, pattern: string): boolean {
+  if (pattern === ref) return true;
+  const regex = new RegExp(
+    "^" +
+      pattern
+        .split("**")
+        .map((segment) =>
+          segment.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*"),
+        )
+        .join(".*") +
+      "$",
+  );
+  return regex.test(ref);
+}
+
+/**
  * Pick a fallback model on a *different* provider than `originalModel`, read
  * from pi's model registry (`<configDir>/models.json`). A model id is
  * `<provider>/<model.id>`, so the provider is the segment before the first
  * slash. Returns the first model on the first different provider; if none, a
  * different model on the same provider; if none, undefined (no retry).
+ * Candidates are restricted to the user's enabledModels patterns when that
+ * setting exists, so a catalog entry the user never enabled (e.g. an image
+ * model) is never picked as a chat fallback.
  *
  * Best-effort and environment-specific: if the registry is absent or no other
  * provider exists, the caller surfaces the original error instead of
@@ -2340,12 +2386,17 @@ function resolveFallbackModel(originalModel: string | undefined): string | undef
   }
   const providers = (parsed as { providers?: Record<string, unknown> } | null)?.providers;
   if (!providers || typeof providers !== "object") return undefined;
+  const enabledPatterns = loadEnabledModelPatterns();
+  const isEnabled = (ref: string) =>
+    !enabledPatterns || enabledPatterns.some((p) => matchesEnabledPattern(ref, p));
   const originalProvider = originalModel ? originalModel.split("/")[0] : undefined;
   const entries = Object.entries(providers) as [string, any][];
   for (const [providerName, provider] of entries) {
     if (providerName === originalProvider) continue;
     const models = Array.isArray(provider?.models) ? provider.models : [];
-    const first = models.find((m: any) => typeof m?.id === "string" && m.id);
+    const first = models.find(
+      (m: any) => typeof m?.id === "string" && m.id && isEnabled(`${providerName}/${m.id}`),
+    );
     if (first) return `${providerName}/${first.id}`;
   }
   // No other provider — fall back to a different model on the same provider.
@@ -2356,7 +2407,10 @@ function resolveFallbackModel(originalModel: string | undefined): string | undef
     const sameProvider = (providers as Record<string, any>)[originalProvider];
     const models = Array.isArray(sameProvider?.models) ? sameProvider.models : [];
     const alt = models.find(
-      (m: any) => typeof m?.id === "string" && `${originalProvider}/${m.id}` !== originalModel,
+      (m: any) =>
+        typeof m?.id === "string" &&
+        `${originalProvider}/${m.id}` !== originalModel &&
+        isEnabled(`${originalProvider}/${m.id}`),
     );
     if (alt) return `${originalProvider}/${alt.id}`;
   }
@@ -2530,7 +2584,11 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
 
-    finishHerdrAgentState(running);
+    // An aborted run (the user pressed Esc in the pane) settles at idle with a
+    // "cancelled" message so herdr's UI can distinguish it from a clean finish.
+    const abortedRun =
+      !!result.errorMessage && /abort/i.test(result.errorMessage) && result.reason === "error";
+    finishHerdrAgentState(running, abortedRun ? "cancelled" : undefined);
     closeSurface(surface);
     const worktree = finishRunningWorktree(running);
     runningSubagents.delete(running.id);

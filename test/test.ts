@@ -76,6 +76,8 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
+  isAbortedError,
+  reportCancelledToHerdr,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { createServer } from "node:net";
@@ -2096,6 +2098,95 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  describe("isAbortedError", () => {
+    it("recognizes a user abort", () => {
+      assert.equal(isAbortedError("This operation was aborted"), true);
+      assert.equal(isAbortedError("Error: This operation was aborted"), true);
+    });
+
+    it("does not classify provider failures as aborts", () => {
+      assert.equal(isAbortedError("503: no capacity"), false);
+      assert.equal(isAbortedError("Request timed out."), false);
+      assert.equal(isAbortedError(undefined), false);
+      assert.equal(isAbortedError(""), false);
+    });
+  });
+
+  describe("reportCancelledToHerdr", () => {
+    it("is a no-op outside a herdr pane", () => {
+      const saved = { ...process.env };
+      delete process.env.HERDR_ENV;
+      delete process.env.HERDR_PANE_ID;
+      delete process.env.PI_SUBAGENT_NAME;
+      try {
+        reportCancelledToHerdr(); // must not throw
+      } finally {
+        process.env.HERDR_ENV = saved.HERDR_ENV;
+        process.env.HERDR_PANE_ID = saved.HERDR_PANE_ID;
+        process.env.PI_SUBAGENT_NAME = saved.PI_SUBAGENT_NAME;
+      }
+    });
+
+    it("reports idle with a cancelled message from inside the pane", () => {
+      const root = createTestDir();
+      const binDir = join(root, "bin");
+      mkdirSync(binDir, { recursive: true });
+      const herdrLog = join(root, "herdr-calls.log");
+      writeFileSync(
+        join(binDir, "herdr"),
+        `#!/bin/sh\necho "$@" >> "${herdrLog}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const saved = { ...process.env };
+      process.env.PATH = `${binDir}:${saved.PATH ?? ""}`;
+      process.env.HERDR_ENV = "1";
+      process.env.HERDR_PANE_ID = "w9:pZ9";
+      process.env.PI_SUBAGENT_NAME = "probe-agent";
+      try {
+        reportCancelledToHerdr();
+        const calls = readFileSync(herdrLog, "utf8").trim().split("\n");
+        assert.equal(calls.length, 1);
+        const call = calls[0];
+        assert.match(call, /pane report-agent w9:pZ9/);
+        assert.match(call, /--source custom:pi-subagents-child/);
+        assert.match(call, /--agent probe-agent/);
+        assert.match(call, /--state idle/);
+        assert.match(call, /--message cancelled/);
+        assert.match(call, /--seq 1/);
+      } finally {
+        if (saved.PATH === undefined) delete process.env.PATH;
+        else process.env.PATH = saved.PATH;
+        if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+        else process.env.HERDR_ENV = saved.HERDR_ENV;
+        if (saved.HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = saved.HERDR_PANE_ID;
+        if (saved.PI_SUBAGENT_NAME === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = saved.PI_SUBAGENT_NAME;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("swallows a missing herdr binary without throwing", () => {
+      const saved = { ...process.env };
+      process.env.PATH = "/nonexistent-dir-for-test";
+      process.env.HERDR_ENV = "1";
+      process.env.HERDR_PANE_ID = "w9:pZ9";
+      process.env.PI_SUBAGENT_NAME = "probe-agent";
+      try {
+        reportCancelledToHerdr(); // must not throw
+      } finally {
+        if (saved.PATH === undefined) delete process.env.PATH;
+        else process.env.PATH = saved.PATH;
+        if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+        else process.env.HERDR_ENV = saved.HERDR_ENV;
+        if (saved.HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = saved.HERDR_PANE_ID;
+        if (saved.PI_SUBAGENT_NAME === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = saved.PI_SUBAGENT_NAME;
+      }
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -4730,6 +4821,95 @@ describe("model resolution on the retry and batch paths", () => {
         "ai-gw-two/other-model",
       );
     });
+  });
+
+  it("never picks a non-enabled model as a retry fallback when enabledModels is set", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      // The first model on the first different provider is an image model
+      // that declares the openai-completions api, exactly like the real
+      // ai-gw-openai catalog. It must be skipped because it is not enabled.
+      writeModelsFile(globalDir, {
+        providers: {
+          "ai-gw-openai": {
+            models: [
+              { id: "openai/gpt-image-fake", api: "openai-completions" },
+              { id: "openai/gpt-6-sol" },
+            ],
+          },
+          "ai-gw-logical": { models: [{ id: "glm-5-3-flash" }] },
+        },
+      });
+      writeSettingsFile(globalDir, {
+        enabledModels: [
+          "ai-gw-logical/**",
+          "ai-gw-openai/openai/gpt-6-sol",
+        ],
+      });
+      assert.equal(
+        testApi.pickRetryFallbackModel(
+          { name: "s", agent: "scout" },
+          { agent: "scout", task: "T", model: "ai-gw-logical/glm-5-3-flash" },
+        ),
+        "ai-gw-openai/openai/gpt-6-sol",
+      );
+    });
+  });
+
+  it("skips the retry entirely when no enabled model exists on another provider", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, {
+        providers: {
+          "p-a": { models: [{ id: "solo" }] },
+          "p-b": { models: [{ id: "unenabled-model" }] },
+        },
+      });
+      writeSettingsFile(globalDir, { enabledModels: ["p-a/**"] });
+      assert.equal(
+        testApi.pickRetryFallbackModel(
+          { name: "s", agent: "scout" },
+          { agent: "scout", task: "T", model: "p-a/solo" },
+        ),
+        undefined,
+      );
+    });
+  });
+
+  it("honors wildcard enabledModels patterns when filtering fallback candidates", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, {
+        providers: {
+          "p-a": { models: [{ id: "solo" }] },
+          "p-b": { models: [{ id: "first-b" }, { id: "second-b" }] },
+        },
+      });
+      writeSettingsFile(globalDir, { enabledModels: ["p-b/second-*"] });
+      assert.equal(
+        testApi.pickRetryFallbackModel(
+          { name: "s", agent: "scout" },
+          { agent: "scout", task: "T", model: "p-a/solo" },
+        ),
+        "p-b/second-b",
+      );
+    });
+  });
+
+  it("never retries a user-aborted subagent run", () => {
+    // A user pressing Esc in a subagent pane surfaces as "This operation was
+    // aborted". Retrying it would ignore the user's intent, so it is NOT
+    // transient even though a provider abort can look identical.
+    assert.equal(testApi.isTransientProviderError("This operation was aborted"), false);
+    assert.equal(testApi.isTransientProviderError("Error: This operation was aborted"), false);
+  });
+
+  it("still retries genuine transient provider errors", () => {
+    assert.equal(testApi.isTransientProviderError("503: no capacity"), true);
+    assert.equal(testApi.isTransientProviderError("502: bad gateway"), true);
+    assert.equal(
+      testApi.isTransientProviderError("provider/agent error — auto-retry exhausted"),
+      true,
+    );
+    assert.equal(testApi.isTransientProviderError("401: unauthorized"), false);
+    assert.equal(testApi.isTransientProviderError(undefined), false);
   });
 
   it("skips the retry, without throwing, when the model became ambiguous after launch", async () => {

@@ -313,6 +313,24 @@ a global hook, so those panes already report for themselves.
 herdr        # then run `pi` in a pane
 ```
 
+## Known upstream issues
+
+### Resumed sessions fail with a provider 400 on tool_addition blocks (pi core)
+
+Resuming a finished sub-agent whose session history contains `tool_addition` blocks fails with a provider 400:
+
+```
+Provider 'anthropic' returned 400 for model '<model>': messages.N.content.M: `tool_addition` blocks require anthropic-beta: inline-tools-2026-09-15
+```
+
+The root cause is in pi core, not this fork. In `dist/bundle/chunks/anthropic-messages-KT2ID7DZ.js`, the `INLINE_TOOLS_BETA` header is pushed only when the current request carries initial tools (`initialTools.length > 0`).
+
+A resumed session that adds no new tools sends an empty initialTools list, so the header is omitted while the replayed history still contains `tool_addition` blocks. The provider rejects the request. Fresh sessions always send initial tools, which is why fresh spawns work.
+
+Workaround: do not retry the resume. Spawn a fresh sub-agent with a complete brief that carries all needed context. This is codified as a tool-contract rule in AGENTS.md.
+
+Verified against pi 1.1.0 on October 9, 2026. Re-check after each pi upgrade: once pi sends the header whenever the outgoing history contains `tool_addition` blocks, this issue is fixed and this note can be removed.
+
 ## Tests
 
 ```bash
