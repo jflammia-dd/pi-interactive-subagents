@@ -2650,7 +2650,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd/maxMs optional, no override knobs", () => {
+  it("exposes a debloated schema: agent+task required, name/model/tools/cwd/maxMs optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2660,8 +2660,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "maxMs", "model", "name", "task"],
-      "only agent/task/name/model/cwd/maxMs should remain",
+      ["agent", "cwd", "maxMs", "model", "name", "task", "tools"],
+      "only agent/task/name/model/tools/cwd/maxMs should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2670,8 +2670,11 @@ describe("tool registration", () => {
     );
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
-    // The removed override knobs must be gone.
-    for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
+    // The removed override knobs must be gone. `tools` is NOT in this list: it
+    // was re-added (2026-10-15) as an ADDITIVE per-dispatch grant merged into
+    // the agent's own loadout — unlike the old knob it never replaces the
+    // loadout, and it is a no-op on unrestricted agents.
+    for (const gone of ["skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
     }
   });
@@ -5127,5 +5130,71 @@ describe("a broken status config cannot take the extension down", () => {
     } finally {
       rmSync(stage, { recursive: true, force: true });
     }
+  });
+});
+
+describe("per-dispatch tool grants and parallel worktree defaults", () => {
+  it("mergeDispatchTools only ever adds; unrestricted agents stay unrestricted", () => {
+    const { mergeDispatchTools } = subagentsModule as any;
+    // No dispatch grant: agent loadout passes through untouched.
+    assert.equal(mergeDispatchTools("read, bash", undefined), "read, bash");
+    assert.equal(mergeDispatchTools("read, bash", ""), "read, bash");
+    assert.equal(mergeDispatchTools("read, bash", "  "), "read, bash");
+    // Grant merges into a restricted loadout.
+    assert.equal(mergeDispatchTools("read, grep", "mcp__slack__*"), "read, grep,mcp__slack__*");
+    // Grant on an UNRESTRICTED agent (no tools line) is a no-op: restricting
+    // an unrestricted child to just the granted names would be a footgun.
+    assert.equal(mergeDispatchTools(undefined, "mcp__slack__*"), undefined);
+    assert.equal(mergeDispatchTools("", "mcp__slack__*"), "");
+    // Both absent.
+    assert.equal(mergeDispatchTools(undefined, undefined), undefined);
+  });
+
+  it("isWriteCapableAgent detects write/edit/bash loadouts and unrestricted agents", () => {
+    const { isWriteCapableAgent } = subagentsModule as any;
+    assert.equal(isWriteCapableAgent("read, write, edit"), true);
+    assert.equal(isWriteCapableAgent("read, edit"), true);
+    assert.equal(isWriteCapableAgent("read, bash, grep"), true);
+    assert.equal(isWriteCapableAgent("read, grep, find, ls, codemode"), false);
+    assert.equal(isWriteCapableAgent("read, safe_bash"), false, "safe_bash is sandboxed");
+    assert.equal(isWriteCapableAgent(undefined), true, "unrestricted agent has every tool");
+    assert.equal(isWriteCapableAgent(""), true);
+  });
+
+  it("resolveParallelWorktree: explicit overrides beat the auto default", () => {
+    const { resolveParallelWorktree } = subagentsModule as any;
+    const base = { batchTaskCount: 3, agentWriteCapable: true, cwdIsGitRepo: true };
+    // Auto default: multi-task batch + write-capable agent + git cwd.
+    assert.equal(resolveParallelWorktree({ ...base }), true);
+    // Single-task batch never auto-isolates (no siblings to collide with).
+    assert.equal(resolveParallelWorktree({ ...base, batchTaskCount: 1 }), false);
+    // Read-only agents share the cwd.
+    assert.equal(resolveParallelWorktree({ ...base, agentWriteCapable: false }), false);
+    // Non-git cwd: nothing to isolate with.
+    assert.equal(resolveParallelWorktree({ ...base, cwdIsGitRepo: false }), false);
+    // Per-task explicit wins over batch and auto.
+    assert.equal(resolveParallelWorktree({ ...base, taskWorktree: false }), false);
+    assert.equal(resolveParallelWorktree({ ...base, agentWriteCapable: false, taskWorktree: true }), true);
+    // Batch explicit wins over auto (both directions).
+    assert.equal(resolveParallelWorktree({ ...base, batchWorktree: false }), false);
+    assert.equal(resolveParallelWorktree({ ...base, agentWriteCapable: false, batchWorktree: true }), true);
+    // Per-task beats batch.
+    assert.equal(resolveParallelWorktree({ ...base, batchWorktree: true, taskWorktree: false }), false);
+  });
+
+  it("subagent_parallel schema exposes per-task tools and worktree plus batch worktree", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const tool = registeredTools.find((t) => t.name === "subagent_parallel");
+    assert.ok(tool, "expected subagent_parallel to be registered");
+
+    const props = tool.parameters.properties;
+    const taskProps = props.tasks.items.properties;
+    assert.equal(taskProps.tools.type, "string");
+    assert.equal(taskProps.worktree.type, "boolean");
+    assert.equal(props.worktree.type, "boolean");
+    // The tool description documents the auto-isolation default.
+    assert.match(tool.description, /isolated git worktree by default/i);
   });
 });

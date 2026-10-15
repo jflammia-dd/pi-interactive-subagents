@@ -69,7 +69,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { createWorktree, finishWorktree, worktreeNote } from "./worktree.ts";
+import { createWorktree, finishWorktree, isGitRepo, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -119,6 +119,15 @@ const SubagentParams = Type.Object({
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  tools: Type.Optional(
+    Type.String({
+      description:
+        "Additional tools to grant this dispatch beyond the agent's fixed loadout, comma-separated " +
+        "(e.g. 'mcp__slack__*' when the brief needs Slack tools the agent does not list). Merged with " +
+        "the agent's tools; MCP names resolve their backing extensions automatically. No effect on " +
+        "unrestricted agents (they already have every tool).",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -1195,6 +1204,53 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
  * spawning grant below have no native-pattern equivalent and are still
  * unioned in here by hand.
  */
+/**
+ * Merge a per-dispatch `tools` grant into an agent's fixed tool loadout.
+ * The dispatch grant only ever ADDS tools: an agent with no `tools:`
+ * restriction is already unrestricted, so a grant there is a no-op rather
+ * than accidentally restricting the child to just the granted names.
+ */
+export function mergeDispatchTools(
+  agentTools: string | undefined,
+  dispatchTools: string | undefined,
+): string | undefined {
+  if (!dispatchTools || !dispatchTools.trim()) return agentTools;
+  if (!agentTools || !agentTools.trim()) return agentTools; // unrestricted stays unrestricted
+  return `${agentTools},${dispatchTools}`;
+}
+
+/**
+ * Whether an agent's fixed loadout can modify files: write/edit tools, or
+ * bash (which can redirect output), or no tools restriction at all (it has
+ * every tool). safe_bash is sandboxed and excluded.
+ */
+export function isWriteCapableAgent(tools: string | undefined): boolean {
+  if (!tools || !tools.trim()) return true;
+  const list = tools.split(",").map((s) => s.trim());
+  return list.includes("write") || list.includes("edit") || list.includes("bash");
+}
+
+/**
+ * Resolve whether one task in a parallel batch should run in an isolated git
+ * worktree. Explicit per-task then batch `worktree` values override the
+ * default. The default is auto: isolate when the batch has multiple tasks,
+ * the agent can write files, and the cwd is a git repo — so sibling authors
+ * cannot overwrite each other's files. Auto-isolation silently skips non-git
+ * cwds (there is nothing to isolate with); an explicit `worktree: true` still
+ * fails loudly at createWorktree.
+ */
+export function resolveParallelWorktree(opts: {
+  taskWorktree?: boolean;
+  batchWorktree?: boolean;
+  batchTaskCount: number;
+  agentWriteCapable: boolean;
+  cwdIsGitRepo: boolean;
+}): boolean {
+  if (opts.taskWorktree !== undefined) return opts.taskWorktree;
+  if (opts.batchWorktree !== undefined) return opts.batchWorktree;
+  return opts.batchTaskCount > 1 && opts.agentWriteCapable && opts.cwdIsGitRepo;
+}
+
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
   opts?: { grantSpawning?: boolean },
@@ -1580,7 +1636,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
  * so an ambiguous ref aborts the whole batch before any task starts.
  */
 function findBatchSpawnProblem(
-  tasks: Array<{ key?: string; agent: string; task?: string; model?: string }>,
+  tasks: Array<{ key?: string; agent: string; task?: string; model?: string; tools?: string }>,
   loadDefs: (agent: string) => AgentDefaults | null = loadAgentDefaults,
 ): string | null {
   for (const task of tasks) {
@@ -1593,7 +1649,7 @@ function findBatchSpawnProblem(
       );
     }
     try {
-      assertCliToolsCompatible(task.agent, defs?.cli, defs?.tools);
+      assertCliToolsCompatible(task.agent, defs?.cli, mergeDispatchTools(defs?.tools, task.tools));
     } catch (err: any) {
       return err?.message ?? String(err);
     }
@@ -1853,7 +1909,7 @@ async function launchSubagentInner(
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const { model: effectiveModel, thinking: effectiveThinking } =
     resolveEffectiveModelAndThinking(params, agentDefs);
-  const effectiveTools = agentDefs?.tools;
+  const effectiveTools = mergeDispatchTools(agentDefs?.tools, params.tools);
   // Before any pane or worktree exists, so a refusal leaks nothing.
   if (agentDefs?.toolsMisparsed) {
     throw new Error(
@@ -3414,9 +3470,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "you do NOT need to poll or wait. Pass a `tasks` array of { key, agent, task, name } objects. " +
         "Each task may set an optional maxMs (milliseconds) to bound the watcher for that dispatch " +
         "(e.g. 2700000 for 45 minutes); the expiry is non-killing. " +
-        "Optionally set `worktree: true` to give each subagent its own git worktree (recommended " +
-        "for agents that edit files, to avoid conflicts). Returns immediately with the list of " +
-        "launched subagent names.",
+        "Write-capable agents in multi-task batches get an isolated git worktree by default, so " +
+        "sibling authors cannot overwrite each other's files (their work lands on pi-subagent/* " +
+        "branches to merge or cherry-pick); override per task or batch with `worktree`. " +
+        "A task may also grant extra tools beyond the agent's loadout (e.g. 'mcp__slack__*') " +
+        "via its `tools` field. Returns immediately with the list of launched subagent names.",
       promptSnippet:
         "Spawn multiple subagents in parallel. Each gets its own pane and task. Results arrive as " +
         "steer messages. Pass tasks: [{ key, agent, task, name }, ...]. Set worktree: true for edit-safe isolation.",
@@ -3428,13 +3486,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: Type.String({ description: "Task/prompt for this sub-agent." }),
             name: Type.String({ description: "The subagent_message resolution handle. Canonicalized to [a-z][a-z0-9_-]{0,31}. This is how other agents find and address this agent. Required." }),
             model: Type.Optional(Type.String({ description: "Model override." })),
+            tools: Type.Optional(Type.String({ description: "Additional tools to grant this task beyond the agent's fixed loadout, comma-separated (e.g. 'mcp__slack__*'). Merged with the agent's tools; no effect on unrestricted agents." })),
             cwd: Type.Optional(Type.String({ description: "Working directory override." })),
             maxMs: Type.Optional(Type.Number({ description: "Optional watcher bound for this dispatch in milliseconds (e.g. 2700000 for 45 minutes). Defaults to PI_SUBAGENT_MAX_MS, then the 6-hour fork default. Non-killing: the pane and worktree remain." })),
+            worktree: Type.Optional(Type.Boolean({ description: "Per-task worktree override. Default is auto: an isolated git worktree when the batch has multiple tasks and the agent can write files." })),
           }),
         ),
         worktree: Type.Optional(
           Type.Boolean({
-            description: "If true, each subagent gets its own git worktree. Recommended for agents that edit files.",
+            description: "Batch-level worktree override for every task. When unset, write-capable agents in multi-task batches are auto-isolated; read-only agents share the cwd.",
           }),
         ),
       }),
@@ -3456,9 +3516,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Validate all agents first — fail the whole batch if any is unknown,
         // rather than spawning a partial set.
+        const allAgentDefs = discoverAgentDefinitions();
         const permittedAgents = SUBAGENT_ALLOWLIST
           ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
+          : allAgentDefs.map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         for (const t of params.tasks) {
           if (!permittedSet.has(t.agent)) {
@@ -3496,6 +3557,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const launched: Array<{ key: string; name: string; agent: string }> = [];
 
+        // Tool loadouts for the auto-worktree decision: a task whose agent can
+        // write files is isolated from its siblings by default.
+        const agentToolsMap = new Map(allAgentDefs.map((a) => [a.name, a.tools] as const));
+
         // Spawn each subagent. Surfaces are created sequentially (herdr pane
         // splits are fast ~4ms each), but the subagents run in parallel once
         // launched. The `worktree` param overrides each agent's own setting.
@@ -3507,12 +3572,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           reservedNames.add(uniqueName);
 
           try {
-            // `worktree: true` on the batch overrides each agent's own setting.
-            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd, maxMs: t.maxMs };
+            // Worktree resolution: explicit per-task, then batch, then the
+            // auto default (multi-task batch + write-capable agent + git cwd).
+            // The agent's own `worktree: true` frontmatter ORs in inside
+            // launchSubagent, as before.
+            const taskWorktree = resolveParallelWorktree({
+              taskWorktree: t.worktree,
+              batchWorktree: params.worktree,
+              batchTaskCount: params.tasks.length,
+              agentWriteCapable: isWriteCapableAgent(agentToolsMap.get(t.agent)),
+              cwdIsGitRepo: isGitRepo(t.cwd ?? ctx.cwd),
+            });
+            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd, maxMs: t.maxMs, tools: t.tools };
             const running = await launchSubagent(
               taskParams,
               ctx,
-              { worktree: params.worktree },
+              { worktree: taskWorktree },
             );
 
             registerName(parentArtifactDir, running.name, registryEntryFor(running));

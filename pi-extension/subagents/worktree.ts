@@ -72,6 +72,20 @@ export function createWorktree(repoCwd: string, name: string): string {
 }
 
 /**
+ * Whether a directory is inside a git worktree. Cheap probe used by the
+ * parallel auto-isolation default: there is nothing to isolate with in a
+ * non-git cwd, so auto-isolation silently skips it there (an explicit
+ * `worktree: true` still fails loudly at createWorktree).
+ */
+export function isGitRepo(cwd: string): boolean {
+  try {
+    return git(["rev-parse", "--is-inside-work-tree"], { cwd }) === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Finish a worktree: commit whatever the subagent left behind, drop the
  * worktree directory, and KEEP the branch.
  *
