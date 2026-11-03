@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
+import { isAcceptableExtensionSpecifier, resolveKeyHint, userMessageDelivery } from "./compat.ts";
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
@@ -222,6 +223,11 @@ const EXTRA_TOOL_EXTENSIONS: Map<string, string> =
 
 /** Register (or re-register) a custom tool's backing extension file. */
 export function registerToolExtension(name: string, extensionPath: string): void {
+  if (!isAcceptableExtensionSpecifier(extensionPath)) {
+    throw new Error(
+      `Cannot register custom tool "${name}": extension must be an absolute path or a builtin: specifier, got "${extensionPath}"`,
+    );
+  }
   if (BUILTIN_TOOLS.has(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a built-in pi tool`);
   }
@@ -3711,7 +3717,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
-      pi.sendUserMessage(toolCall);
+      pi.sendUserMessage(toolCall, userMessageDelivery(ctx.isIdle()));
     },
   });
 
@@ -3815,7 +3821,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
             }
           }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push(theme.fg("muted", resolveKeyHint(options, keyHint)("app.tools.expand", "to expand")));
         }
 
         // Render via Box for background + padding, with blank line above for separation
@@ -3845,7 +3851,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           contentLines.push(theme.fg("muted", `+${overflow} more running.`));
         }
         if (!options.expanded) {
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push(theme.fg("muted", resolveKeyHint(options, keyHint)("app.tools.expand", "to expand")));
         }
 
         const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
@@ -3881,7 +3887,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } else {
           const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push(theme.fg("muted", resolveKeyHint(options, keyHint)("app.tools.expand", "to expand")));
         }
 
         const box = new Box(1, 1, bgFn);
@@ -3930,7 +3936,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } else {
           const preview = summary.split("\n")[0].slice(0, width - 10);
           if (preview) contentLines.push(theme.fg("dim", preview));
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push(theme.fg("muted", resolveKeyHint(options, keyHint)("app.tools.expand", "to expand")));
         }
 
         const box = new Box(1, 1, bgFn);

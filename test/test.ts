@@ -2597,6 +2597,7 @@ describe("commands", () => {
     assert.ok(subagent, "expected /subagent to be registered");
 
     subagent.handler("scout map the auth code", {
+      isIdle: () => true,
       ui: { notify() {} },
     });
 
