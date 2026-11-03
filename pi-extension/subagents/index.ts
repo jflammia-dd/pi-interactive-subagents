@@ -1552,6 +1552,19 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
+  // The agent has exited: its pane now holds a shell, so typed text would run as shell commands.
+  // The activity file is written by the agent itself and reports phase "done" once it ends.
+  if (running.cli !== "claude" && running.activity?.phase === "done") {
+    const err =
+      `Subagent "${running.name}" has exited (its activity file reports phase "done"), so pane ${running.surface} ` +
+      `holds a shell, not an agent. The message was NOT sent. Close that pane, then call subagent_message again ` +
+      `to resume the session in a new pane.`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name, status: "exited" },
+    };
+  }
+
   const steer = steerSubagent(running, message, send);
   if ("error" in steer) {
     return {

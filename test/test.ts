@@ -3089,6 +3089,83 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("refuses to steer a subagent whose activity file reports it exited, and sends nothing", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile, now: () => 1_000 });
+      recorder.sessionStart();
+      recorder.agentEndDone();
+      const sent: string[] = [];
+      try {
+        runningMap.set("a1", makeRunning({ activityFile }));
+        const result = testApi.handleSubagentSteer({ name: "Worker", message: "rm -rf /tmp/x; echo hi" }, (_s: string, text: string) => {
+          sent.push(text);
+        });
+        assert.deepEqual(sent, [], "nothing may be typed into a pane whose agent has exited");
+        assert.equal(result.details.status, "exited");
+        assert.match(result.content[0].text, /has exited/);
+        assert.match(result.content[0].text, /NOT sent/);
+        assert.match(result.content[0].text, /pane-1/);
+        assert.equal(runningMap.has("a1"), true, "the registry entry is left for the watcher to clear");
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("still steers a subagent whose activity file reports it is working or waiting", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    for (const finish of ["none", "waiting"] as const) {
+      runningMap.clear();
+      withTempDir((dir) => {
+        const activityFile = getSubagentActivityFile(dir, "a1");
+        const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile, now: () => 1_000 });
+        recorder.sessionStart();
+        recorder.agentStart();
+        if (finish === "waiting") recorder.agentEndWaiting();
+        const sent: string[] = [];
+        try {
+          runningMap.set("a1", makeRunning({ activityFile }));
+          const result = testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (_s: string, text: string) => {
+            sent.push(text);
+          });
+          assert.deepEqual(sent, ["keep going"], finish);
+          assert.equal(result.details.status, "steered", finish);
+        } finally {
+          runningMap.clear();
+        }
+      });
+    }
+  });
+
+  it("steers as before when the activity file is missing or unreadable", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      mkdirSync(dirname(activityFile), { recursive: true });
+      writeFileSync(activityFile, "{ not json");
+      for (const file of [activityFile, join(dir, "does-not-exist.json"), undefined]) {
+        const sent: string[] = [];
+        try {
+          runningMap.set("a1", makeRunning({ activityFile: file }));
+          const result = testApi.handleSubagentSteer({ name: "Worker", message: "hello" }, (_s: string, text: string) => {
+            sent.push(text);
+          });
+          assert.deepEqual(sent, ["hello"], String(file));
+          assert.equal(result.details.status, "steered");
+        } finally {
+          runningMap.clear();
+        }
+      }
+    });
+  });
+
   it("requires a message when steering", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
