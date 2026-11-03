@@ -10,10 +10,20 @@
  *
  * Tests that exercise user-level overrides build their own fixture dir
  * (withIsolatedAgentEnv in test.ts) and restore this one afterwards.
+ *
+ * The same rule covers the PI_SUBAGENT_* variables. A suite run from inside a
+ * subagent pane inherits that pane's identity, allowlist and surface, which
+ * turns top-level spawn tests into child-agent tests. They are removed here so
+ * the suite behaves the same in a subagent pane as in a plain shell. Tests that
+ * need one of them set it explicitly.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("PI_SUBAGENT_")) delete process.env[name];
+}
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-subagents-agent-dir-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;

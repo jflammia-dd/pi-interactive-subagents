@@ -145,3 +145,10 @@ describe("registerToolExtension specifier check", () => {
     registry.delete("compat_test_builtin");
   });
 });
+
+describe("test isolation", () => {
+  it("removes inherited PI_SUBAGENT_* variables so a suite run inside a subagent pane matches a plain shell", () => {
+    const leaked = Object.keys(process.env).filter((name) => name.startsWith("PI_SUBAGENT_"));
+    assert.deepEqual(leaked, []);
+  });
+});
