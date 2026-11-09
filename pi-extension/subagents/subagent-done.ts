@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { execFileSync } from "node:child_process";
 import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { registerHumanWait } from "./human-wait.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -155,6 +156,7 @@ export function reportCancelledToHerdr(): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerHumanWait(pi);
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;

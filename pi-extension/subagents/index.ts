@@ -13,6 +13,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  lstatSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -72,6 +73,7 @@ import {
 } from "./activity.ts";
 import { createWorktree, finishWorktree, isGitRepo, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
+import { HUMAN_WAIT_LEASE_MS, readHumanWait, readHumanWaitOwner, writeHumanWaitOwner } from "./human-wait.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1020,6 +1022,9 @@ interface RunningSubagent {
   interactive: boolean;
   /** Last lifecycle state reported to herdr, so we only report transitions. */
   herdrState?: AgentReportState;
+  herdrRetryState?: AgentReportState;
+  herdrNextRetryAt?: number;
+  herdrObservedAt?: number;
   /** Path to the git worktree this subagent runs in, if worktree isolation is on. */
   worktreePath?: string;
   /** JSON Schema for structured output validation, if the agent declares one. */
@@ -1061,6 +1066,7 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
+let stopHumanWaitRefresh: (() => void) | undefined;
 
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -1398,12 +1404,132 @@ const HERDR_STATE_BY_KIND: Record<SubagentStatusKind, AgentReportState | null> =
  * notifications, `agent list` and `agent wait` agree with the status widget.
  * Reports transitions only — a spawn per tick would be wasteful and pointless.
  */
-function syncHerdrAgentState(running: RunningSubagent, observedAt: number): void {
+const HUMAN_WAIT_RETRY_MS = 5_000;
+
+function syncHerdrAgentState(running: RunningSubagent, observedAt: number, deferExpiry = false): void {
   const snapshot = classifyStatus(running.statusState, observedAt);
-  const state = HERDR_STATE_BY_KIND[snapshot.kind];
+  const wait = process.env.HERDR_ENV === "1" && running.activityFile &&
+    running.activity?.phase !== "done" && !existsSync(`${running.sessionFile}.exit`)
+    ? readHumanWait(running.activityFile, running.id, running.startTime, observedAt, { deferExpiry })
+    : null;
+  const state = wait && wait.pane === running.surface && wait.name === running.name && wait.count > 0
+    ? "blocked" : HERDR_STATE_BY_KIND[snapshot.kind];
   if (!state || state === running.herdrState) return;
-  running.herdrState = state;
-  reportAgentState(running.surface, running.name, state, snapshot.activityLabel ?? undefined);
+  if (running.herdrRetryState === state && observedAt < (running.herdrNextRetryAt ?? 0)) return;
+  running.herdrRetryState = state;
+  running.herdrState = reportAgentState(running.surface, running.name, state, snapshot.activityLabel ?? undefined)
+    ? state : undefined;
+  running.herdrNextRetryAt = running.herdrState ? 0 : observedAt + HUMAN_WAIT_RETRY_MS;
+}
+
+/**
+ * Reconcile sidebar state after a parent restart without resuming any child.
+ * Only the parent's launch record grants ownership, never a child's claimed pane.
+ * Sibling sessions may release stale authority but never acquire it. This also
+ * covers watcher timeouts and disabled widgets while a child is still alive.
+ */
+function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined {
+  if (process.env.HERDR_ENV !== "1" || !ctx.sessionManager?.getSessionDir ||
+      !ctx.sessionManager?.getSessionId) return;
+  const dir = join(getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()), "subagent-activity");
+  const recovered = new Map<string, {
+    surface: string; name: string; pid: number; startedAt: number;
+    state: AgentReportState; reported: boolean; nextRetryAt: number;
+  }>();
+  const staleReleases = new Map<string, { identity: string; released: boolean; nextRetryAt: number }>();
+  let lastTick = Date.now();
+  function release(file: string, now = Date.now(), force = false): boolean {
+    const prior = recovered.get(file);
+    if (!prior) return true;
+    if (!force && now < prior.nextRetryAt) return false;
+    reportAgentState(prior.surface, prior.name, "idle");
+    if (!releaseAgentState(prior.surface, prior.name)) {
+      prior.nextRetryAt = now + HUMAN_WAIT_RETRY_MS;
+      return false;
+    }
+    recovered.delete(file);
+    return true;
+  }
+  function cleanSiblingWaits(now: number, deferExpiry: boolean): void {
+    const root = dirname(dirname(dir));
+    let sessions: string[] = [];
+    try { sessions = readdirSync(root); } catch {}
+    for (const session of sessions) {
+      const sibling = join(root, session, "subagent-activity");
+      if (sibling === dir) continue;
+      let files: string[];
+      try {
+        if (!lstatSync(join(root, session)).isDirectory() || !lstatSync(sibling).isDirectory()) continue;
+        files = readdirSync(sibling);
+      } catch { continue; }
+      for (const file of files) {
+        if (!/^[a-z0-9_-]{1,64}\.json\.wait$/i.test(file)) continue;
+        const id = file.slice(0, -10);
+        if (runningSubagents.has(id)) continue;
+        const activityFile = join(sibling, `${id}.json`);
+        const owner = readHumanWaitOwner(activityFile, id);
+        if (!owner || owner.pane === process.env.HERDR_PANE_ID) continue;
+        const wait = readHumanWait(activityFile, id, owner.startedAt, now, { allowDead: true, deferExpiry });
+        if (!wait || owner.pane !== wait.pane || owner.name !== wait.name ||
+            (wait.alive && !wait.expired && wait.count > 0)) continue;
+        const identity = `${owner.startedAt}:${wait.pid}:${wait.updatedAt}:${wait.count}`;
+        const prior = staleReleases.get(activityFile);
+        if (prior?.identity === identity && (prior.released || now < prior.nextRetryAt)) continue;
+        // Release only our recorded source. Never report idle over a new session's work.
+        const released = releaseAgentState(owner.pane, owner.name);
+        staleReleases.set(activityFile, { identity, released, nextRetryAt: now + HUMAN_WAIT_RETRY_MS });
+      }
+    }
+  }
+  function refresh(): void {
+    const now = Date.now();
+    const deferExpiry = now - lastTick > HUMAN_WAIT_LEASE_MS;
+    lastTick = now;
+    for (const running of runningSubagents.values()) observeRunningSubagent(running, now, deferExpiry);
+    cleanSiblingWaits(now, deferExpiry);
+    const seen = new Set<string>();
+    let files: string[] = [];
+    try { files = readdirSync(dir); } catch {}
+    for (const file of files) {
+      if (!/^[a-z0-9_-]{1,64}\.json\.wait$/i.test(file)) continue;
+      const id = file.slice(0, -10);
+      const activityFile = join(dir, `${id}.json`);
+      // The regular observer owns live entries. Never release its authority.
+      if (runningSubagents.has(id)) { recovered.delete(file); continue; }
+      const owner = readHumanWaitOwner(activityFile, id);
+      if (!owner) continue;
+      const wait = readHumanWait(activityFile, id, owner.startedAt, now, { deferExpiry });
+      if (!wait || wait.pane !== owner.pane || wait.name !== owner.name ||
+          wait.pane === process.env.HERDR_PANE_ID ||
+          (wait.expired && !recovered.has(file))) continue;
+      const activity = readSubagentActivityFile(activityFile, id);
+      if (activity.ok && activity.activity.phase === "done") continue;
+      seen.add(file);
+      const prior = recovered.get(file);
+      if (prior && (prior.surface !== wait.pane || prior.name !== wait.name ||
+          prior.pid !== wait.pid || prior.startedAt !== wait.startedAt) && !release(file)) continue;
+      const state: AgentReportState = wait.count > 0 ? "blocked" :
+        activity.ok && (activity.activity.phase === "active" || activity.activity.phase === "starting")
+          ? "working" : "idle";
+      const cached = recovered.get(file);
+      if (cached?.state !== state || (!cached.reported && now >= cached.nextRetryAt)) {
+        const reported = reportAgentState(owner.pane, owner.name, state);
+        recovered.set(file, {
+          surface: owner.pane, name: owner.name, pid: wait.pid,
+          startedAt: wait.startedAt, state, reported,
+          nextRetryAt: reported ? 0 : now + HUMAN_WAIT_RETRY_MS,
+        });
+      }
+    }
+    for (const file of recovered.keys()) if (!seen.has(file)) release(file);
+  }
+  refresh();
+  const timer = setInterval(refresh, 1000);
+  timer.unref?.();
+  return () => {
+    clearInterval(timer);
+    for (const file of recovered.keys()) release(file, Date.now(), true);
+  };
 }
 
 /** Settle the pane at idle and hand lifecycle authority back to herdr. */
@@ -1416,8 +1542,10 @@ function finishHerdrAgentState(running: RunningSubagent, message?: string): void
   releaseAgentState(running.surface, running.name);
 }
 
-function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
+function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(), deferExpiry = false) {
   if (running.cli === "claude") return;
+  deferExpiry ||= running.herdrObservedAt !== undefined && observedAt - running.herdrObservedAt > HUMAN_WAIT_LEASE_MS;
+  running.herdrObservedAt = observedAt;
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -1443,7 +1571,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       activityLabel: activityLabel(read.activity),
       toolStartedAt: read.activity.toolStartedAt,
     }, observedAt);
-    syncHerdrAgentState(running, observedAt);
+    syncHerdrAgentState(running, observedAt, deferExpiry);
     return;
   }
 
@@ -1451,7 +1579,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     snapshot: read.reason,
     snapshotError: read.error,
   }, observedAt);
-  syncHerdrAgentState(running, observedAt);
+  syncHerdrAgentState(running, observedAt, deferExpiry);
 }
 
 /**
@@ -1855,6 +1983,8 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
+  startHumanWaitRefresh,
+  finishHerdrAgentState,
   getToolExtensionSpecifiers,
   resolveRunningByName,
   uniqueRunningName,
@@ -2017,6 +2147,10 @@ async function launchSubagentInner(
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  if (process.env.HERDR_ENV === "1" && agentDefs?.cli !== "claude") {
+    writeHumanWaitOwner(activityFile, { version: 1, runningChildId: id, startedAt: startTime,
+      pane: surface, name: params.name, herdrSession: process.env.HERDR_SESSION ?? "" });
+  }
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -2168,6 +2302,7 @@ async function launchSubagentInner(
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_START_TIME=${shellEscape(String(startTime))}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
@@ -2592,10 +2727,9 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
-        // ponytail: observeRunningSubagent also runs from the status interval,
-        // so it reads each subagent's activity file twice a second. Accepted:
-        // two small reads per subagent, and syncHerdrAgentState short-circuits
-        // unless the state actually changed. Collapse it if the file grows.
+        // Status and human-wait recovery ticks also observe these small files.
+        // The independent recovery tick survives watcher timeouts and disabled
+        // widgets. State reporting sends only transitions or failed-report retries.
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
       },
@@ -2787,6 +2921,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    stopHumanWaitRefresh?.();
+    stopHumanWaitRefresh = startHumanWaitRefresh(ctx);
     // No codemode-provider check here: panes load codemode via the native
     // `-e builtin:codemode` specifier, and pi fails loudly ("Unknown built-in
     // extension") if it ever stops resolving. The fork's unit suite asserts
@@ -2804,6 +2940,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    stopHumanWaitRefresh?.();
+    stopHumanWaitRefresh = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -3341,6 +3479,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        if (process.env.HERDR_ENV === "1") {
+          writeHumanWaitOwner(activityFile, { version: 1, runningChildId: id, startedAt: startTime,
+            pane: surface, name, herdrSession: process.env.HERDR_SESSION ?? "" });
+        }
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
         applySandboxToParts(parts, loadout, { artifactDir, name });
@@ -3380,6 +3522,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_START_TIME=${shellEscape(String(startTime))}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
