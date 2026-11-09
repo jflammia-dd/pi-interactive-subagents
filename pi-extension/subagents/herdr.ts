@@ -68,8 +68,8 @@ function requireHerdr(): void {
  * stderr is captured rather than inherited: herdr prints a JSON error blob
  * there on any failure, and letting that reach the terminal corrupts pi's TUI.
  */
-function herdrCli(args: string[]): string {
-  return execFileSync("herdr", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+function herdrCli(args: string[], timeout?: number): string {
+  return execFileSync("herdr", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout });
 }
 
 // ── Shell helpers ──
@@ -426,8 +426,14 @@ const AGENT_SOURCE = "custom:pi-subagents";
 
 export type AgentReportState = "working" | "idle" | "blocked" | "unknown";
 
-/** herdr ignores stale reports from the same source by sequence number. */
-let reportSeq = 0;
+/** Preserve ordering across reload and seed above earlier process reports. */
+const REPORT_SEQ_KEY = Symbol.for("pi-subagents/herdr-report-seq");
+function nextReportSeq(): number {
+  const globals = globalThis as unknown as Record<symbol, number>;
+  const seq = Math.max(globals[REPORT_SEQ_KEY] || 0, Date.now() * 1000) + 1;
+  globals[REPORT_SEQ_KEY] = seq;
+  return seq;
+}
 
 /**
  * The one name shape a subagent uses everywhere: herdr's agent-label pattern,
@@ -467,28 +473,31 @@ export function reportAgentState(
   name: string,
   state: AgentReportState,
   message?: string,
-): void {
+): boolean {
   try {
     herdrCli([
       "pane", "report-agent", surface,
       "--source", AGENT_SOURCE,
       "--agent", canonicalSubagentName(name),
       "--state", state,
-      "--seq", String(++reportSeq),
+      "--seq", String(nextReportSeq()),
       ...(message ? ["--message", message.slice(0, 120)] : []),
-    ]);
-  } catch {}
+    ], 2000);
+    return true;
+  } catch { return false; }
 }
 
 /** Hand lifecycle authority for this pane back to herdr. */
-export function releaseAgentState(surface: string, name: string): void {
+export function releaseAgentState(surface: string, name: string): boolean {
   try {
     herdrCli([
       "pane", "release-agent", surface,
       "--source", AGENT_SOURCE,
       "--agent", canonicalSubagentName(name),
-    ]);
-  } catch {}
+      "--seq", String(nextReportSeq()),
+    ], 2000);
+    return true;
+  } catch { return false; }
 }
 
 /**

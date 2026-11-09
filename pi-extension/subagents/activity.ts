@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -182,6 +182,21 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
 
+/** Never follow links or block on a pipe, including a path replaced after lstat. */
+export function readRegularFile(file: string, maxBytes: number): string {
+  const entry = lstatSync(file);
+  if (!entry.isFile() || entry.size > maxBytes) throw new Error("Not a bounded regular file");
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) throw new Error("Not a bounded regular file");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const size = readSync(fd, buffer, 0, buffer.length, 0);
+    if (size > maxBytes) throw new Error("File exceeds size limit");
+    return buffer.toString("utf8", 0, size);
+  } finally { closeSync(fd); }
+}
+
 export function readSubagentActivityFile(
   activityFile: string,
   expectedRunningChildId: string,
@@ -190,7 +205,7 @@ export function readSubagentActivityFile(
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(activityFile, "utf8"));
+    parsed = JSON.parse(readRegularFile(activityFile, 64 * 1024));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: "invalid", error: message };

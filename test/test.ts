@@ -208,7 +208,7 @@ async function withIsolatedAgentEnv(
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
-  const globalDir = join(root, "global");
+  const globalDir = join(root, "config", "agent");
   const globalAgentsDir = join(globalDir, "agents");
 
   mkdirSync(projectAgentsDir, { recursive: true });
@@ -1624,7 +1624,8 @@ describe("subagent discovery", () => {
     // `../../dd/datadog-pi-packages/packages/research-web` (relative to the
     // agent config dir). The resolver points at the same file, so isolate
     // PI_CODING_AGENT_DIR and create that exact path on disk.
-    await withIsolatedAgentEnv(({ globalDir }) => {
+    await withIsolatedAgentEnv(({ globalDir, projectDir }) => {
+      assert.ok(resolve(globalDir, "../../dd").startsWith(`${dirname(projectDir)}/`), "package fixture must stay inside its per-run temp root");
       const researchWebExt = resolve(
         globalDir,
         "../../dd/datadog-pi-packages/packages/research-web/extensions/research-web/index.ts",
@@ -5274,5 +5275,829 @@ describe("per-dispatch tool grants and parallel worktree defaults", () => {
     assert.equal(props.worktree.type, "boolean");
     // The tool description documents the auto-isolation default.
     assert.match(tool.description, /isolated git worktree by default/i);
+  });
+});
+
+import fs from "node:fs";
+import { syncBuiltinESMExports as syncWaitFilesystemExports } from "node:module";
+import { readHumanWait } from "../pi-extension/subagents/human-wait.ts";
+import { reportAgentState, releaseAgentState } from "../pi-extension/subagents/herdr.ts";
+
+describe("child human wait reporting", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function fixture(inHerdr = true, pane = "w2:p2") {
+    const dir = createTestDir();
+    const saved = new Map<string, string | undefined>();
+    const setEnv = (key: string, value: string) => {
+      if (!saved.has(key)) saved.set(key, process.env[key]);
+      process.env[key] = value;
+    };
+    const startTime = Date.now() - 10;
+    const activityFile = join(dir, "child.json");
+    const callsFile = join(dir, "herdr-calls.jsonl");
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "herdr"), [
+      "#!/usr/bin/env node",
+      `import { appendFileSync, existsSync } from 'node:fs';`,
+      `if (existsSync(${JSON.stringify(join(dir, "fail-report"))})) process.exit(1);`,
+      `appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+      `if (existsSync(${JSON.stringify(join(dir, "ambiguous-report"))})) process.exit(1);`,
+    ].join("\n"), { mode: 0o755 });
+    setEnv("PATH", `${bin}:${process.env.PATH}`);
+    setEnv("HERDR_ENV", inHerdr ? "1" : "0");
+    setEnv("HERDR_PANE_ID", pane);
+    setEnv("PI_SUBAGENT_SURFACE", pane);
+    setEnv("PI_SUBAGENT_ID", "child");
+    setEnv("PI_SUBAGENT_NAME", "child");
+    setEnv("PI_SUBAGENT_START_TIME", String(startTime));
+    setEnv("PI_SUBAGENT_ACTIVITY_FILE", activityFile);
+    setEnv("PI_SUBAGENT_SESSION", join(dir, "child.jsonl"));
+    setEnv("PI_SUBAGENT_AUTO_EXIT", "0");
+    const handlers = new Map<string, Function[]>();
+    const bus = new Map<string, Set<Function>>();
+    const { api } = createMockExtensionApi();
+    api.on = (name: string, fn: Function) => {
+      handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    };
+    api.events = {
+      on(name: string, fn: Function) {
+        if (!bus.has(name)) bus.set(name, new Set());
+        bus.get(name)!.add(fn);
+        return () => bus.get(name)?.delete(fn);
+      },
+    };
+    const ctx = { mode: "tui", ui: { setWidget() {} }, shutdown() {} };
+    const emit = (name: string, event: any = {}) => {
+      const previousPane = process.env.HERDR_PANE_ID;
+      if (name === "session_start") process.env.HERDR_PANE_ID = pane;
+      try { for (const fn of handlers.get(name) ?? []) fn(event, ctx); }
+      finally { restoreEnvVar("HERDR_PANE_ID", previousPane); }
+    };
+    subagentDoneExtension(api);
+    emit("session_start", { reason: "startup" });
+    emit("agent_start");
+    setEnv("HERDR_PANE_ID", "w1:p1");
+    const running: any = {
+      id: "child", name: "child", surface: pane, startTime,
+      sessionFile: join(dir, "child.jsonl"), activityFile, interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+    };
+    return {
+      dir, running, activityFile, emit,
+      bus(name: string, event: unknown) { for (const fn of bus.get(name) ?? []) fn(event); },
+      observe(now = Date.now()) { testApi.observeRunningSubagent(running, now); return running.herdrState; },
+      calls() { return existsSync(callsFile) ? readFileSync(callsFile, "utf8").trim().split("\n").map((s) => JSON.parse(s)) : []; },
+      close() {
+        emit("session_shutdown", { reason: "quit" });
+        for (const [key, value] of saved) restoreEnvVar(key, value);
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function owner(dir: string, f: ReturnType<typeof fixture>, patch = {}) {
+    mkdirSync(dir, { recursive: true });
+    const value = { version: 1, runningChildId: "child", startedAt: f.running.startTime,
+      pane: f.running.surface, name: "child", herdrSession: process.env.HERDR_SESSION ?? "", ...patch };
+    writeFileSync(join(dir, `${value.runningChildId}.json.owner`), JSON.stringify(value), { mode: 0o600 });
+  }
+
+  function recovery(f: ReturnType<typeof fixture>, session = "parent") {
+    let tick: () => void = () => {};
+    const originalSet = globalThis.setInterval;
+    const originalClear = globalThis.clearInterval;
+    const originalNow = Date.now;
+    let clock = Date.now();
+    Date.now = () => clock;
+    globalThis.setInterval = ((fn: () => void) => { tick = fn; return { unref() {} }; }) as any;
+    globalThis.clearInterval = (() => {}) as any;
+    let stop: (() => void) | undefined;
+    try {
+      stop = testApi.startHumanWaitRefresh({ sessionManager: {
+        getSessionDir: () => f.dir, getSessionId: () => session,
+      } });
+    } catch (error) {
+      Date.now = originalNow;
+      throw error;
+    } finally {
+      globalThis.setInterval = originalSet;
+      globalThis.clearInterval = originalClear;
+    }
+    return {
+      tick(ms = 1000) { clock += ms; tick(); },
+      close() { try { stop?.(); } finally { Date.now = originalNow; } },
+    };
+  }
+
+  function copyRecovery(f: ReturnType<typeof fixture>, session = "parent") {
+    const dir = join(f.dir, "artifacts", session, "subagent-activity");
+    owner(dir, f);
+    cpSync(f.activityFile, join(dir, "child.json"));
+    cpSync(`${f.activityFile}.wait`, join(dir, "child.json.wait"));
+    return dir;
+  }
+
+  it("fix2 accepts letter-bearing pane ids in child and recovered paths", () => {
+    for (const pane of ["w9P:pE", "w9S:p2", "wA1:p1", "w90:pX"]) {
+      const f = fixture(true, pane);
+      let r: ReturnType<typeof recovery> | undefined;
+      try {
+        f.emit("ui_prompt_start", { kind: "confirm" });
+        assert.equal(f.observe(), "blocked", `real pane ${pane} must report blocked`);
+        copyRecovery(f);
+        r = recovery(f);
+        assert.equal(f.calls().filter((a) => a[1] === "report-agent").length, 2, "letter-bearing orphan must recover");
+      } finally { r?.close(); f.close(); }
+    }
+  });
+
+  for (const kind of ["fifo", "symlink", "directory"]) for (const suffix of ["", ".wait"]) {
+    it(`fix2 rejects ${kind} ${suffix || 'activity'} files promptly`, () => {
+      const f = fixture();
+      try {
+        f.emit("ui_prompt_start", { kind: "confirm" });
+          const target = `${f.activityFile}${suffix}`;
+          const real = `${target}.real`;
+          fs.renameSync(target, real);
+          if (kind === "fifo") execFileSync("mkfifo", [target], { timeout: 1000 });
+          else if (kind === "symlink") symlinkSync(real, target);
+          else mkdirSync(target);
+          const module = suffix ? "human-wait.ts" : "activity.ts";
+          const script = suffix
+            ? `import { readHumanWait as read } from './pi-extension/subagents/${module}'; if(read(process.argv[1], 'child')) process.exit(2);`
+            : `import { readSubagentActivityFile as read } from './pi-extension/subagents/${module}'; if(read(process.argv[1], 'child').ok) process.exit(2);`;
+          const start = performance.now();
+          assert.doesNotThrow(() => execFileSync(process.execPath, ["--input-type=module", "-e", script, f.activityFile], {
+            cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."), timeout: 1500,
+          }), `${kind} ${suffix || 'activity'} must be rejected without blocking`);
+          assert.ok(performance.now() - start < 1500, "non-regular file must return promptly");
+          rmSync(target, { recursive: true, force: true });
+          fs.renameSync(real, target);
+      } finally { f.close(); }
+    });
+  }
+
+  it("fix2 ignores a forged orphan pane and name without parent ownership", () => {
+    const f = fixture();
+    let r: ReturnType<typeof recovery> | undefined;
+    try {
+      f.emit("ui_prompt_start", { kind: "input" });
+      const dir = copyRecovery(f);
+      const file = join(dir, "child.json.wait");
+      const wait = JSON.parse(readFileSync(file, "utf8"));
+      writeFileSync(file, JSON.stringify({ ...wait, pane: "w3:p3", name: "victim" }));
+      r = recovery(f);
+      assert.equal(f.calls().length, 0, "forged pane must not receive parent authority");
+    } finally { r?.close(); f.close(); }
+  });
+
+  for (const path of ["launch", "resume"]) it(`fix2 persists parent ownership on ${path}`, async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "scout", "name: scout\ndescription: Test scout\ntools: read");
+      const f = fixture();
+      const shutdown: Function[] = [];
+      try {
+        writeFileSync(join(f.dir, "bin", "herdr"), [
+          "#!/usr/bin/env node",
+          `if (process.argv[3] === 'split') console.log(JSON.stringify({ result: { pane: { pane_id: 'w9S:pE' } } }));`,
+        ].join("\n"), { mode: 0o755 });
+        const parent = join(f.dir, "parent.jsonl");
+        writeFileSync(parent, JSON.stringify({ type: "session", id: "parent", cwd: projectDir }) + "\n");
+        const ctx = { cwd: projectDir, hasUI: false, sessionManager: {
+          getSessionDir: () => f.dir, getSessionId: () => "parent", getSessionFile: () => parent,
+        } };
+        const dir = join(f.dir, "artifacts", "parent", "subagent-activity");
+        let expected: any;
+        if (path === "launch") {
+          expected = await testApi.launchSubagent({ agent: "scout", name: "owned-child", task: "test" }, ctx, { surface: "w9S:pE" });
+        } else {
+          const session = join(f.dir, "resume.jsonl");
+          writeFileSync(session, JSON.stringify({ type: "session", id: "resume", cwd: projectDir }) + "\n");
+          writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+          registerName(join(f.dir, "artifacts", "parent"), "owned-child", { sessionFile: session, sessionId: "resume" });
+          writeSubagentLoadout(session, { agent: "scout", toolAllowlist: "read", model: null,
+            thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+            autoExit: true, cwd: projectDir, agentDir: process.env.PI_CODING_AGENT_DIR ?? null });
+          const { api, registeredTools } = createMockExtensionApi();
+          api.on = (name: string, fn: Function) => { if (name === "session_shutdown") shutdown.push(fn); };
+          (subagentsModule as any).default(api);
+          const result = await registeredTools.find((t) => t.name === "subagent_message")!.execute(
+            "resume-call", { name: "owned-child", message: "continue" }, undefined, undefined, ctx);
+          assert.equal(result.details?.status, "started", "fake resume must reach the real launch path");
+          expected = { id: result.details.id, name: "owned-child", surface: "w9S:pE" };
+          await new Promise<void>((done) => setImmediate(done));
+        }
+        const file = join(dir, `${expected.id}.json.owner`);
+        assert.ok(existsSync(file), `${path} must persist a parent-owned pane record before dispatch`);
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        assert.equal(record.runningChildId, expected.id);
+        assert.equal(record.pane, "w9S:pE");
+        assert.equal(record.name, expected.name);
+        assert.ok(record.startedAt > 0);
+        if (expected.startTime) assert.equal(record.startedAt, expected.startTime);
+        assert.equal(record.herdrSession, process.env.HERDR_SESSION ?? "");
+        assert.equal(statSync(file).mode & 0o777, 0o600, "parent launch record must be private");
+        assert.equal(readdirSync(dir).some((name) => name.endsWith(".tmp")), false);
+      } finally {
+        for (const fn of shutdown) fn({ reason: "quit" }, {});
+        for (const [id, running] of testApi.runningSubagents) {
+          running.abortController?.abort();
+          testApi.runningSubagents.delete(id);
+        }
+        f.close();
+      }
+    });
+  });
+
+  it("fix2 backs off failed live and orphan reports with an injected clock", () => {
+    const f = fixture();
+    let r: ReturnType<typeof recovery> | undefined;
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      writeFileSync(join(f.dir, "ambiguous-report"), "fail after acceptance");
+      const now = Date.now();
+      f.observe(now);
+      f.observe(now + 1000);
+      assert.equal(f.calls().length, 1, "live report must wait five seconds before retrying");
+      f.observe(now + 5000);
+      assert.equal(f.calls().length, 2, "live report must retry after backoff");
+      rmSync(join(f.dir, "ambiguous-report"));
+      const waitFile = `${f.activityFile}.wait`;
+      const wait = JSON.parse(readFileSync(waitFile, "utf8"));
+      writeFileSync(waitFile, JSON.stringify({ ...wait, updatedAt: now + 10000 }));
+      f.observe(now + 10000);
+      assert.equal(f.running.herdrState, "blocked", "live retry must cache only success");
+      writeFileSync(waitFile, JSON.stringify(wait));
+      copyRecovery(f);
+      writeFileSync(join(f.dir, "ambiguous-report"), "fail orphan acknowledgement");
+      r = recovery(f);
+      const n = f.calls().length;
+      r.tick();
+      assert.equal(f.calls().length, n, "orphan report must also back off");
+      r.tick(4000);
+      assert.equal(f.calls().length, n + 1, "failed orphan report must actually retry");
+      rmSync(join(f.dir, "ambiguous-report"));
+      const recoveredWait = join(f.dir, "artifacts", "parent", "subagent-activity", "child.json.wait");
+      writeFileSync(recoveredWait, JSON.stringify({ ...wait, updatedAt: Date.now() + 5000 }));
+      r.tick(5000);
+      const successful = f.calls().length;
+      r.tick();
+      assert.equal(f.calls().length, successful, "successful orphan report must be cached");
+    } finally { r?.close(); f.close(); }
+  });
+
+  it("fix2 defers lease expiry for one wake tick only", () => {
+    const f = fixture();
+    let r: ReturnType<typeof recovery> | undefined;
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      copyRecovery(f);
+      r = recovery(f);
+      r.tick(30000);
+      const states = () => f.calls().filter((a) => a[1] === "report-agent").map((a) => a[a.indexOf("--state") + 1]);
+      assert.deepEqual(states(), ["blocked"], "wake tick must not clear an expired lease before heartbeat renewal");
+      r.tick();
+      assert.equal(states().at(-1), "working", "expiry must resume on the following tick");
+    } finally { r?.close(); f.close(); }
+  });
+
+  it("fix2 gives the live watcher one wake tick before expiring a wait", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      const now = Date.now();
+      assert.equal(f.observe(now), "blocked");
+      assert.equal(f.observe(now + 30000), "blocked", "first live observation after sleep must allow heartbeat renewal");
+      assert.notEqual(f.observe(now + 31000), "blocked", "a second tick must expire an unrenewed live wait");
+    } finally { f.close(); }
+  });
+
+  it("fix2 cleans only trusted dead expired or cleared waits from sibling sessions", () => {
+    const f = fixture(true, "w9S:pE");
+    let r: ReturnType<typeof recovery> | undefined;
+    try {
+      f.emit("ui_prompt_start", { kind: "input" });
+      const dir = copyRecovery(f, "older");
+      const file = join(dir, "child.json.wait");
+      const wait = JSON.parse(readFileSync(file, "utf8"));
+      r = recovery(f, "fresh");
+      assert.equal(f.calls().length, 0, "fresh session must not take authority over a live sibling wait");
+      writeFileSync(file, JSON.stringify({ ...wait, count: 0 }));
+      r.tick();
+      assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "fresh session must release a trusted closed wait");
+      assert.ok(f.calls().every((a) => a[2] === "w9S:pE"));
+      r.tick();
+      assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "cleared sibling must not be released repeatedly");
+      for (const [id, patch] of [["expired", { updatedAt: Date.now() - 9000 }], ["dead", { pid: 2147483647 }]] as const) {
+        owner(dir, f, { runningChildId: id, startedAt: Date.now() - 20000 });
+        writeFileSync(join(dir, `${id}.json.wait`), JSON.stringify({ ...wait, runningChildId: id,
+          startedAt: Date.now() - 20000, ...patch }));
+      }
+      writeFileSync(join(dir, "forged.json.wait"), JSON.stringify({ ...wait, runningChildId: "forged", count: 0, pane: "w90:pX" }));
+      r.tick();
+      assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 3, "trusted expired and dead waits must clear");
+      assert.ok(f.calls().every((a) => a[2] !== "w90:pX"), "unowned sibling must not be released");
+    } finally { r?.close(); f.close(); }
+  });
+
+  it("fix2 validates size count pane and id independently", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "input" });
+      const file = `${f.activityFile}.wait`;
+      const wait = JSON.parse(readFileSync(file, "utf8"));
+      for (const [label, patch, id] of [
+        ["size", { padding: "x".repeat(4096) }, "child"],
+        ["count", { count: 10001 }, "child"],
+        ["pane", { pane: "w2:p2\ninjected" }, "child"],
+        ["id", { runningChildId: "bad.id" }, "bad.id"],
+      ] as const) {
+        writeFileSync(file, JSON.stringify({ ...wait, ...patch }));
+        assert.equal(readHumanWait(f.activityFile, id), null, `${label} alone must be rejected`);
+      }
+    } finally { f.close(); }
+  });
+
+  it("fix2 uses strictly increasing sequences in one millisecond and releases on finish", () => {
+    const f = fixture();
+    const originalNow = Date.now;
+    try {
+      const now = Date.now();
+      Date.now = () => now;
+      reportAgentState("w9P:pE", "child", "blocked");
+      reportAgentState("w9P:pE", "child", "working");
+      releaseAgentState("w9P:pE", "child");
+      f.running.herdrState = "blocked";
+      testApi.finishHerdrAgentState(f.running);
+      const calls = f.calls();
+      const seqs = calls.map((a) => Number(a[a.indexOf("--seq") + 1]));
+      assert.ok(calls.every((a) => a.includes("--seq")), "every release must carry a sequence");
+      assert.ok(seqs.every((n, i) => !i || n > seqs[i - 1]), "reports in the same millisecond must strictly increase");
+      assert.equal(calls.filter((a) => a[1] === "release-agent").length, 2, "finish must release child authority");
+    } finally { Date.now = originalNow; f.close(); }
+  });
+
+  it("fix2 stops recovered authority and does not reconcile a live runner twice", () => {
+    const f = fixture();
+    let r: ReturnType<typeof recovery> | undefined;
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      copyRecovery(f);
+      testApi.runningSubagents.set("child", f.running);
+      r = recovery(f);
+      assert.equal(f.calls().length, 1, "only the live observer must report this child");
+      testApi.runningSubagents.delete("child");
+      r.tick();
+      const n = f.calls().length;
+      r.close(); r = undefined;
+      assert.ok(f.calls().length > n && f.calls().at(-1)[1] === "release-agent", "stop must release recovered authority");
+    } finally { testApi.runningSubagents.delete("child"); r?.close(); f.close(); }
+  });
+
+  it("fix2 tears down wait state at session start without shutdown", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "input" });
+      f.bus("rpiv:ask-user:blocked", { active: true, toolCallId: "q" });
+      f.emit("session_start", { reason: "new" });
+      assert.equal(JSON.parse(readFileSync(`${f.activityFile}.wait`, "utf8")).count, 0, "session start must discard every old wait source");
+      f.emit("ui_prompt_start", { kind: "editor" });
+      assert.equal(JSON.parse(readFileSync(`${f.activityFile}.wait`, "utf8")).count, 1, "session start must not duplicate subscriptions");
+    } finally { f.close(); }
+  });
+
+  it("fix2 ignores an otherwise valid sidecar outside HERDR_ENV", () => {
+    const f = fixture(false);
+    try {
+      writeFileSync(`${f.activityFile}.wait`, JSON.stringify({ version: 1, runningChildId: "child",
+        startedAt: f.running.startTime, pid: process.pid, pane: "w2:p2", name: "child",
+        herdrSession: process.env.HERDR_SESSION ?? "", count: 1, updatedAt: Date.now() }));
+      assert.equal(f.observe(), "working", "outside herdr even a valid sidecar must not override ordinary state");
+    } finally { f.close(); }
+  });
+
+  it("fix2 writes atomically with mode 0600 and no partial destination", () => {
+    const f = fixture();
+    const write = fs.writeFileSync;
+    const rename = fs.renameSync;
+    const file = `${f.activityFile}.wait`;
+    const prior = readFileSync(file, "utf8");
+    let tempWritten = false;
+    let renamed = false;
+    fs.writeFileSync = ((dest: any, data: any, options: any) => {
+      if (String(dest).includes(".wait")) {
+        assert.notEqual(String(dest), file, "wait write must target a temporary file");
+        assert.equal(readFileSync(file, "utf8"), prior, "reader must see the entire prior snapshot until rename");
+        tempWritten = true;
+      }
+      return write(dest, data, options);
+    }) as typeof write;
+    fs.renameSync = ((from: any, to: any) => {
+      if (String(to) === file) {
+        assert.ok(tempWritten, "rename must follow the completed temporary write");
+        assert.equal(JSON.parse(readFileSync(from, "utf8")).count, 1);
+        assert.equal(statSync(from).mode & 0o777, 0o600, "wait file must be private before publication");
+        renamed = true;
+      }
+      return rename(from, to);
+    }) as typeof rename;
+    syncWaitFilesystemExports();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.ok(tempWritten && renamed, "wait must publish through temp then rename");
+      assert.equal(statSync(file).mode & 0o777, 0o600, "published wait must have mode 0600");
+      assert.equal(JSON.parse(readFileSync(file, "utf8")).count, 1);
+    } finally {
+      fs.writeFileSync = write; fs.renameSync = rename; syncWaitFilesystemExports(); f.close();
+    }
+  });
+
+  it("reports a native child wait as blocked and restores the prior state", () => {
+    const f = fixture();
+    try {
+      assert.equal(f.observe(), "working");
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked", "native child wait must report blocked, not working");
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      assert.equal(f.observe(), "working", "ending the wait must restore working");
+      const reports = f.calls().filter((args) => args[1] === "report-agent");
+      assert.deepEqual(reports.map((args) => args[args.indexOf("--state") + 1]), ["working", "blocked", "working"]);
+      assert.ok(reports.every((args) => args[2] === "w2:p2"), "the main pane must never be reported");
+      assert.ok(reports.every((args) => args[args.indexOf("--source") + 1] === "custom:pi-subagents"));
+    } finally { f.close(); }
+  });
+
+  it("distinguishes an orchestrator wait from a human wait and restores idle", () => {
+    const f = fixture();
+    try {
+      f.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+      assert.equal(f.observe(), "idle", "an orchestrator or child-result wait is not a human prompt");
+      f.emit("ui_prompt_start", { kind: "input" });
+      assert.equal(f.observe(), "blocked", "a human prompt must override an idle child");
+      f.emit("ui_prompt_end", { kind: "input" });
+      assert.equal(f.observe(), "idle", "closing the prompt must restore idle rather than invent work");
+    } finally { f.close(); }
+  });
+
+  it("balances nested and overlapping native waits", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "select" });
+      f.emit("ui_prompt_start", { kind: "select" });
+      f.emit("ui_prompt_start", { kind: "input" });
+      f.emit("ui_prompt_end", { kind: "select" });
+      f.emit("ui_prompt_end", { kind: "input" });
+      assert.equal(f.observe(), "blocked", "one of the nested waits is still open");
+      f.emit("ui_prompt_end", { kind: "editor" });
+      assert.equal(f.observe(), "blocked", "an unmatched end must not close a different kind");
+      f.emit("ui_prompt_end", { kind: "select" });
+      assert.equal(f.observe(), "working");
+    } finally { f.close(); }
+  });
+
+  it("ignores a stale wait from a previous run with the same id", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "editor" });
+      assert.equal(f.observe(), "blocked", "editor wait must create a readable blocked sidecar");
+      const waitFile = `${f.activityFile}.wait`;
+      const wait = JSON.parse(readFileSync(waitFile, "utf8"));
+      writeFileSync(waitFile, JSON.stringify({ ...wait, startedAt: f.running.startTime - 1 }));
+      assert.equal(f.observe(), "working", "old run identity must not turn a new run red");
+    } finally { f.close(); }
+  });
+
+  it("ignores waits after a child exit even if its sidecar remains", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "input" });
+      assert.equal(f.observe(), "blocked", "input wait must set blocked before exit");
+      const oldWait = readFileSync(`${f.activityFile}.wait`, "utf8");
+      writeFileSync(`${f.running.sessionFile}.exit`, JSON.stringify({ type: "error" }));
+      assert.notEqual(f.observe(), "blocked", "an exit sidecar must take precedence over a wait");
+      rmSync(`${f.running.sessionFile}.exit`);
+      f.emit("session_shutdown", { reason: "quit" });
+      writeFileSync(`${f.activityFile}.wait`, oldWait);
+      assert.notEqual(f.observe(), "blocked", "a done activity snapshot must also override a leftover wait");
+    } finally { f.close(); }
+  });
+
+  it("has no effect outside herdr", () => {
+    const f = fixture(false);
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "working");
+      assert.equal(existsSync(`${f.activityFile}.wait`), false);
+    } finally { f.close(); }
+  });
+
+  it("ignores generic custom screens", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "custom" });
+      assert.equal(f.observe(), "working");
+      f.emit("ui_prompt_end", { kind: "custom" });
+      assert.equal(f.observe(), "working");
+    } finally { f.close(); }
+  });
+
+  it("balances rpiv custom questions and releases on tool completion", () => {
+    const f = fixture();
+    try {
+      f.bus("rpiv:ask-user:blocked", { active: true, toolCallId: "q1" });
+      f.bus("rpiv:ask-user:blocked", { active: true, toolCallId: "q1" });
+      f.bus("rpiv:ask-user:blocked", { active: true, toolCallId: "q2" });
+      f.emit("tool_execution_end", { toolCallId: "q1" });
+      assert.equal(f.observe(), "blocked", "the second custom question is still open");
+      f.bus("rpiv:ask-user:blocked", { active: false, toolCallId: "q2" });
+      assert.equal(f.observe(), "working");
+    } finally { f.close(); }
+  });
+
+  it("does not clear an explicit guard wait when another question closes", () => {
+    const f = fixture();
+    try {
+      f.bus("herdr:blocked", { active: true });
+      f.bus("rpiv:ask-user:blocked", { active: true, toolCallId: "q1" });
+      f.bus("rpiv:ask-user:blocked", { active: false, toolCallId: "q1" });
+      assert.equal(f.observe(), "blocked", "guard wait must retain its own depth");
+      f.bus("herdr:blocked", { active: false });
+      assert.equal(f.observe(), "working");
+    } finally { f.close(); }
+  });
+
+  it("clears on shutdown/reload and ignores late end/start events", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked");
+      f.emit("session_shutdown", { reason: "reload" });
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.notEqual(f.observe(), "blocked", "late events from the retired runtime must do nothing");
+      f.emit("session_start", { reason: "reload" });
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      f.emit("ui_prompt_start", { kind: "editor" });
+      assert.equal(f.observe(), "blocked");
+      f.emit("ui_prompt_end", { kind: "editor" });
+      assert.notEqual(f.observe(), "blocked");
+    } finally { f.close(); }
+  });
+
+  it("rejects dead writers, malformed payloads and oversized sidecars", () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      const file = `${f.activityFile}.wait`;
+      assert.equal(f.observe(), "blocked", "valid wait must be present before corrupting it");
+      const valid = JSON.parse(readFileSync(file, "utf8"));
+      const deadPid = Number(execFileSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }));
+      const invalid = [
+        "{", "null", "[]", " ".repeat(4097),
+        ...[{ count: -1 }, { count: 1e20 }, { count: "1" }, { pid: deadPid },
+          { runningChildId: "wrong" }, { pane: "w1:p1" }, { name: "another" },
+          { herdrSession: "different-herdr-session" },
+          { version: 2 }, { updatedAt: Date.now() + 60000 }].map((patch) => JSON.stringify({ ...valid, ...patch })),
+      ];
+      for (const content of invalid) {
+        writeFileSync(file, content);
+        assert.notEqual(f.observe(), "blocked", `must reject invalid wait ${content.slice(0, 60)}`);
+      }
+    } finally { f.close(); }
+  });
+
+  it("expires a missed clear but keeps a genuine long wait renewed", async () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked");
+      const file = `${f.activityFile}.wait`;
+      const initial = JSON.parse(readFileSync(file, "utf8"));
+      // Move observation time forward rather than keeping a test alive for the lease.
+      testApi.observeRunningSubagent(f.running, Date.now() + 7000);
+      testApi.observeRunningSubagent(f.running, Date.now() + 9000);
+      assert.notEqual(f.running.herdrState, "blocked", "an unrenewed lease cannot stay red");
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      const renewed = JSON.parse(readFileSync(file, "utf8"));
+      assert.ok(renewed.updatedAt > initial.updatedAt, "open wait must publish a heartbeat without agent activity");
+      assert.equal(f.observe(), "blocked");
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      const closed = readFileSync(file, "utf8");
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.equal(readFileSync(file, "utf8"), closed, "a closed wait must leave no heartbeat timer");
+    } finally { f.close(); }
+  });
+
+  it("retries a failed clear report and advances seq across module reload", async () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked");
+      const marker = join(f.dir, "fail-report");
+      writeFileSync(marker, "fail");
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      assert.notEqual(f.observe(), "working", "a failed clear must not be cached as a success");
+      rmSync(marker);
+      assert.equal(f.observe(Date.now() + 5000), "working", "next eligible tick must retry the failed clear");
+      const moduleUrl = new URL("../pi-extension/subagents/herdr.ts", import.meta.url).href + `?reload=${Date.now()}`;
+      const reloaded = await import(moduleUrl);
+      reloaded.reportAgentState("w2:p2", "child", "working");
+      const seqs = f.calls().filter((args) => args[1] === "report-agent").map((args) => Number(args[args.indexOf("--seq") + 1]));
+      assert.ok(seqs.every((seq, i) => seq >= Date.now() * 1000 - 1e7 && (!i || seq > seqs[i - 1])), "reload must not reset the report sequence");
+    } finally { f.close(); }
+  });
+
+  it("clears even if a blocked report landed but its acknowledgement failed", () => {
+    const f = fixture();
+    try {
+      assert.equal(f.observe(), "working");
+      const marker = join(f.dir, "ambiguous-report");
+      writeFileSync(marker, "fail after accepting the report");
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      f.observe();
+      rmSync(marker);
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      assert.equal(f.observe(), "working");
+      const reports = f.calls().filter((args) => args[1] === "report-agent");
+      assert.deepEqual(reports.map((args) => args[args.indexOf("--state") + 1]), ["working", "blocked", "working"], "an ambiguous report must invalidate the old cache");
+    } finally { f.close(); }
+  });
+
+  it("cleans failed atomic writes and retries a close without agent activity", async () => {
+    const f = fixture();
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked");
+      const file = `${f.activityFile}.wait`;
+      rmSync(file);
+      mkdirSync(file);
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      assert.equal(readdirSync(f.dir).some((name) => name.endsWith(".tmp")), false, "failed atomic write must remove its temp file");
+      rmSync(file, { recursive: true });
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.equal(JSON.parse(readFileSync(file, "utf8")).count, 0, "a failed close must be retried by the heartbeat");
+      assert.equal(f.observe(), "working");
+    } finally { f.close(); }
+  });
+
+  it("cleans crash-left temp files for dead writers without touching live writers", () => {
+    const f = fixture();
+    try {
+      const deadPid = Number(execFileSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }));
+      const suffix = "12345678-1234-1234-1234-123456789abc.tmp";
+      const orphan = `${f.activityFile}.wait.${deadPid}.${suffix}`;
+      const priorChild = join(f.dir, `previous-child.json.wait.${deadPid}.${suffix}`);
+      const live = `${f.activityFile}.wait.${process.pid}.${suffix}`;
+      writeFileSync(orphan, "partial");
+      writeFileSync(priorChild, "partial from another child in this session");
+      writeFileSync(live, "not ours to remove");
+      f.emit("session_start", { reason: "reload" });
+      assert.equal(existsSync(orphan), false, "a dead writer's partial wait file must be removed on startup");
+      assert.equal(existsSync(priorChild), false, "a new child must clean crash leftovers even when its id differs");
+      assert.equal(existsSync(live), true, "another live writer's temp file must remain untouched");
+    } finally { f.close(); }
+  });
+
+  it("keeps several children's state separate", () => {
+    const a = fixture();
+    const b = fixture();
+    try {
+      a.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(a.observe(), "blocked");
+      assert.equal(b.observe(), "working", "a sibling must not inherit the first child's wait");
+      b.emit("ui_prompt_start", { kind: "input" });
+      a.emit("ui_prompt_end", { kind: "confirm" });
+      assert.equal(a.observe(), "working");
+      assert.equal(b.observe(), "blocked");
+    } finally { b.close(); a.close(); }
+  });
+
+  it("reconciles an orphaned wait on parent startup and clears it on the next tick", async () => {
+    const f = fixture();
+    const handlers = new Map<string, Function[]>();
+    const { api } = createMockExtensionApi();
+    api.on = (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    const ctx = {
+      hasUI: false,
+      sessionManager: { getSessionDir: () => f.dir, getSessionId: () => "parent" },
+    };
+    const fire = (name: string) => { for (const fn of handlers.get(name) ?? []) fn({}, ctx); };
+    const recoveryDir = join(f.dir, "artifacts", "parent", "subagent-activity");
+    mkdirSync(recoveryDir, { recursive: true });
+    const copy = () => {
+      owner(recoveryDir, f);
+      cpSync(f.activityFile, join(recoveryDir, "child.json"));
+      cpSync(`${f.activityFile}.wait`, join(recoveryDir, "child.json.wait"));
+    };
+    try {
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      copy();
+      (subagentsModule as any).default(api);
+      fire("session_start");
+      const lastState = () => {
+        const report = f.calls().filter((args) => args[1] === "report-agent").at(-1);
+        return report?.[report.indexOf("--state") + 1];
+      };
+      assert.equal(lastState(), "blocked", "parent startup must recover a live orphan's wait");
+      const file = join(recoveryDir, "child.json.wait");
+      const wait = JSON.parse(readFileSync(file, "utf8"));
+      owner(recoveryDir, f, { runningChildId: "main", name: "parent", pane: "w1:p1" });
+      writeFileSync(join(recoveryDir, "main.json.wait"), JSON.stringify({ ...wait, runningChildId: "main", name: "parent", pane: "w1:p1" }));
+      owner(recoveryDir, f, { runningChildId: "stale", name: "stale", pane: "w3:p3", startedAt: Date.now() - 20000 });
+      writeFileSync(join(recoveryDir, "stale.json.wait"), JSON.stringify({ ...wait,
+        runningChildId: "stale", name: "stale", pane: "w3:p3",
+        startedAt: Date.now() - 20000, updatedAt: Date.now() - 9000,
+      }));
+      const reportCount = () => f.calls().filter((args) => args[1] === "report-agent" && args[args.indexOf("--state") + 1] === "blocked").length;
+      const before = reportCount();
+      owner(recoveryDir, f, { startedAt: wait.startedAt + 1 });
+      writeFileSync(file, JSON.stringify({ ...wait, startedAt: wait.startedAt + 1 }));
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.ok(reportCount() > before, "a new run in the same pane must not inherit the old reporter cache");
+      assert.ok(f.calls().every((args) => args[2] !== "w3:p3"), "an expired orphan sidecar must not create fresh lifecycle authority");
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      copy();
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.equal(lastState(), "working", "recovery tick must observe the clear without a watcher or widget");
+      const marker = join(f.dir, "fail-report");
+      writeFileSync(marker, "fail release");
+      f.emit("session_shutdown", { reason: "quit" });
+      copy();
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      rmSync(marker);
+      await new Promise((resolve) => setTimeout(resolve, 5100));
+      assert.equal(lastState(), "idle", "a completed child must retry a failed release");
+      assert.ok(f.calls().some((args) => args[1] === "release-agent"));
+      assert.ok(f.calls().every((args) => args[2] !== "w1:p1"), "recovery must not report the main pane");
+    } finally { fire("session_shutdown"); f.close(); }
+  });
+
+  it("end to end: sends blocked and clear through the real herdr CLI to a fake socket", async (t) => {
+    const f = fixture();
+    const oldSocket = process.env.HERDR_SOCKET_PATH;
+    const oldPath = process.env.PATH;
+    const realPath = oldPath!.split(":").slice(1).join(":");
+    let protocol: number;
+    try {
+      protocol = JSON.parse(execFileSync("herdr", ["api", "schema", "--json"], {
+        env: { ...process.env, PATH: realPath }, encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+      })).protocol;
+    } catch (error: any) {
+      f.close();
+      if (error?.code === "ENOENT") { t.skip("herdr CLI is not installed"); return; }
+      throw error;
+    }
+    // Unix socket paths have a small byte limit, independent of TMPDIR length.
+    const socketDir = mkdtempSync("/tmp/pi-wait-socket-");
+    const socketFile = join(socketDir, "herdr.sock");
+    const requestsFile = join(f.dir, "requests.jsonl");
+    const serverFile = join(f.dir, "fake-server.ts");
+    writeFileSync(serverFile, [
+      `import { createServer } from 'node:net';`,
+      `import { appendFileSync } from 'node:fs';`,
+      `createServer((socket) => {`,
+      `  let buffer = '';`,
+      `  socket.on('data', (chunk) => {`,
+      `    buffer += chunk;`,
+      `    if (!buffer.includes('\\n')) return;`,
+      `    const request = JSON.parse(buffer.split('\\n')[0]);`,
+      `    appendFileSync(${JSON.stringify(requestsFile)}, JSON.stringify(request) + '\\n');`,
+      `    const result = request.method === 'ping' ? { type: 'pong', version: 'test', protocol: ${protocol} } : { type: 'ok' };`,
+      `    socket.end(JSON.stringify({ id: request.id, result }) + '\\n');`,
+      `  });`,
+      `  socket.on('error', () => {});`,
+      `}).listen(${JSON.stringify(socketFile)}, () => process.stdout.write('READY\\n'));`,
+    ].join("\n"));
+    const server = spawn(process.execPath, [serverFile], { stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("fake socket startup timed out")), 5000);
+        server.once("error", (error) => { clearTimeout(timer); reject(error); });
+        server.once("exit", () => { clearTimeout(timer); reject(new Error("fake socket server exited before readiness")); });
+        server.stdout!.once("data", () => { clearTimeout(timer); resolve(); });
+      });
+      process.env.HERDR_SOCKET_PATH = socketFile;
+      process.env.PATH = realPath;
+      assert.equal(f.observe(), "working");
+      f.emit("ui_prompt_start", { kind: "confirm" });
+      assert.equal(f.observe(), "blocked");
+      f.emit("ui_prompt_end", { kind: "confirm" });
+      assert.equal(f.observe(), "working");
+      const reports = readFileSync(requestsFile, "utf8").trim().split("\n").map((s) => JSON.parse(s)).filter((r) => r.method === "pane.report_agent");
+      assert.deepEqual(reports.map((r) => r.params.state), ["working", "blocked", "working"]);
+      assert.ok(reports.every((r) => r.params.pane_id === "w2:p2" && r.params.source === "custom:pi-subagents"));
+      assert.ok(reports.every((r) => !r.params.agent_session_path && !r.params.agent_session_id), "state reporting must not enable an unsandboxed resume");
+    } finally {
+      restoreEnvVar("HERDR_SOCKET_PATH", oldSocket);
+      restoreEnvVar("PATH", oldPath);
+      if (server.exitCode === null && server.signalCode === null) {
+        const exit = new Promise<void>((resolve) => server.once("exit", () => resolve()));
+        server.kill("SIGKILL");
+        await exit;
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+      f.close();
+    }
   });
 });
