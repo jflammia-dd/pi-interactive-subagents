@@ -1002,11 +1002,14 @@ function watchForSentinel(
       }
       // No match: herdr may have restarted. Wait a beat so nothing spins, then
       // look again.
-      const retry = setTimeout(
-        () => watchForSentinel(surface, id, signal, onExit, onGone),
-        1000,
-      );
-      signal.addEventListener("abort", () => clearTimeout(retry), { once: true });
+      const retry = setTimeout(() => {
+        signal.removeEventListener("abort", cancelRetry);
+        watchForSentinel(surface, id, signal, onExit, onGone);
+      }, 1000);
+      function cancelRetry() {
+        clearTimeout(retry);
+      }
+      signal.addEventListener("abort", cancelRetry, { once: true });
     },
   );
 
@@ -1075,13 +1078,15 @@ export async function pollForExit(
     doneId: string;
     sessionFile?: string;
     sentinelFile?: string;
-    /** Give up after this long. Default 6h; a subagent is never infinite. */
+    /** Active watch budget. Default 6h. Infinity keeps a reconcile watch open. */
     maxMs?: number;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
-  const start = Date.now();
+  let lastTick = Date.now();
+  let elapsedMs = 0;
   const maxMs = options.maxMs ?? 6 * 60 * 60 * 1000;
+  const maxTickGap = Math.max(30_000, 2 * options.interval);
 
   // herdr watches the pane for the sentinel; we only poll the sidecar files.
   const watch = new AbortController();
@@ -1105,6 +1110,13 @@ export async function pollForExit(
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
+
+    // A suspended laptop does not spend the active watch budget. Ignore clock
+    // rollback too, while allowing intentionally slow polling intervals.
+    const now = Date.now();
+    const gap = now - lastTick;
+    if (gap > 0 && gap <= maxTickGap) elapsedMs += gap;
+    lastTick = now;
 
     // Fast path: check for .exit sidecar file (written by the error path)
     if (options.sessionFile) {
@@ -1144,7 +1156,7 @@ export async function pollForExit(
       };
     }
 
-    if (Date.now() - start > maxMs) {
+    if (elapsedMs > maxMs) {
       return {
         reason: "timeout",
         exitCode: 1,
@@ -1152,7 +1164,7 @@ export async function pollForExit(
       };
     }
 
-    const elapsed = Math.floor((Date.now() - start) / 1000);
+    const elapsed = Math.floor(elapsedMs / 1000);
     // The tick callbacks observe a LIVE subagent (status snapshot, pending
     // question). A throw from one — a sendMessage into an invalidated
     // extension runner, say — would escape the loop and land in

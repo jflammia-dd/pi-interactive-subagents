@@ -16,7 +16,9 @@ import {
 import { join, dirname, resolve } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn } from "node:child_process";
+import childProcess, { execFileSync, spawn } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { getEventListeners } from "node:events";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -4602,6 +4604,110 @@ describe("a fork child's result is its own, not the parent's", () => {
 });
 
 describe("pollForExit is bounded and reports a vanished pane", () => {
+  it("ignores sleep gaps but still expires after the active watch budget", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const controller = new AbortController();
+    const ticks: number[] = [];
+    const pending = pollForExit("w99:p99", controller.signal, {
+      interval: 1000,
+      doneId: "sleep-budget",
+      maxMs: 2500,
+      onTick: (elapsed) => ticks.push(elapsed),
+    });
+    try {
+      t.mock.timers.tick(1000);
+      await Promise.resolve();
+      // Moving the clock does not run timers. The next tick represents wake.
+      t.mock.timers.setTime(3_600_000);
+      t.mock.timers.tick(0);
+      await Promise.resolve();
+      t.mock.timers.tick(1000);
+      await Promise.resolve();
+      t.mock.timers.tick(1000);
+      const result = await pending;
+      assert.equal(result.reason, "timeout");
+      assert.deepEqual(ticks, [0, 1, 1, 2], "sleep must not consume the remaining active budget");
+    } finally {
+      controller.abort();
+      await pending.catch(() => {});
+    }
+  });
+
+  it("ignores clock rollback without granting extra active watch time", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let now = 5000;
+    t.mock.method(Date, "now", () => now);
+    const controller = new AbortController();
+    const ticks: number[] = [];
+    const pending = pollForExit("w99:p99", controller.signal, {
+      interval: 1000, doneId: "clock-rollback", maxMs: 1500,
+      onTick: (elapsed) => ticks.push(elapsed),
+    });
+    try {
+      for (const timestamp of [0, 1000, 2000]) {
+        now = timestamp;
+        t.mock.timers.tick(1000);
+        await Promise.resolve();
+      }
+      assert.deepEqual(ticks, [0, 0, 1], "a clock correction must not produce negative elapsed time");
+      assert.equal((await pending).reason, "timeout");
+    } finally {
+      controller.abort();
+      await pending.catch(() => {});
+    }
+  });
+
+  it("counts intentionally slow polling as active time", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const controller = new AbortController();
+    const pending = pollForExit("w99:p99", controller.signal, {
+      interval: 60_000, doneId: "slow-poll", maxMs: 90_000,
+    });
+    try {
+      t.mock.timers.tick(60_000);
+      await Promise.resolve();
+      t.mock.timers.tick(60_000);
+      assert.equal((await pending).reason, "timeout");
+    } finally {
+      controller.abort();
+      await pending.catch(() => {});
+    }
+  });
+
+  it("does not accumulate abort listeners when the sentinel watch retries", async (t) => {
+    const combinedSignals: AbortSignal[] = [];
+    const any = AbortSignal.any;
+    t.mock.method(AbortSignal, "any", (signals: AbortSignal[]) => {
+      const combined = any(signals);
+      combinedSignals.push(combined);
+      return combined;
+    });
+    let callback: any;
+    t.mock.method(childProcess, "execFile", (_command: string, _args: string[], _options: any, cb: any) => {
+      callback = cb;
+      return { kill() { cb(new Error("Aborted"), "", ""); } };
+    });
+    syncBuiltinESMExports();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const controller = new AbortController();
+    const pending = pollForExit("w99:p99", controller.signal, {
+      interval: 10_000, doneId: "retry-listeners", maxMs: Infinity,
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        callback(new Error("Herdr unavailable"), "", "connection refused");
+        t.mock.timers.tick(1000);
+        assert.equal(getEventListeners(combinedSignals[0], "abort").length, 1,
+          "each retry must remove its abort listener when the timer fires");
+      }
+    } finally {
+      controller.abort();
+      await pending.catch(() => {});
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  });
+
   it("gives up watching after maxMs and says so without claiming the agent stopped", async () => {
     // A timeout that fell through to the normal completion path would close a
     // live agent's pane and finish its worktree.
@@ -4737,6 +4843,267 @@ describe("per-dispatch maxMs bounds the watcher", () => {
     } finally {
       restoreEnvVar("PI_SUBAGENT_MAX_MS", previous);
     }
+  });
+});
+
+describe("completion delivery after a watch timeout", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  async function setup(t: any, toolName = "subagent") {
+    const dir = createTestDir();
+    const savedEnv = Object.fromEntries(
+      ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_SUBAGENT_MAX_MS"]
+        .map((key) => [key, process.env[key]]),
+    );
+    process.env.HERDR_ENV = "1";
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_SOCKET_PATH;
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_SUBAGENT_MAX_MS = "1000";
+    const commands: string[][] = [];
+    const sentinelCallbacks: Array<(error: Error | null, stdout: string, stderr: string) => void> = [];
+    let watches = 0;
+    let stoppedWatches = 0;
+    t.mock.method(childProcess, "execFileSync", (command: string, args: string[]) => {
+      commands.push([command, ...args]);
+      if (command === "sh") return "";
+      if (command === "git") throw new Error("No git operation expected in this fixture");
+      assert.equal(command, "herdr");
+      if (args[1] === "split") return JSON.stringify({ result: { pane: { pane_id: "w99:p99" } } });
+      return "{}";
+    });
+    t.mock.method(childProcess, "execFile", (command: string, args: string[], _options: any, callback: any) => {
+      assert.equal(command, "herdr");
+      assert.equal(args[1], "wait-output");
+      watches++;
+      let stopped = false;
+      const finish = (error: Error | null, stdout: string, stderr: string) => {
+        if (stopped) return;
+        stopped = true;
+        stoppedWatches++;
+        callback(error, stdout, stderr);
+      };
+      sentinelCallbacks.push(finish);
+      return { kill() { finish(new Error("Aborted"), "", ""); } };
+    });
+    syncBuiltinESMExports();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: 0 });
+    const mock = createMockExtensionApi();
+    const handlers = new Map<string, any>();
+    mock.api.on = (event: string, handler: any) => handlers.set(event, handler);
+    const widgets: any[] = [];
+    const ctx = {
+      cwd: dir,
+      hasUI: true,
+      ui: { setWidget(_key: string, value: any) { widgets.push(value); }, notify() {} },
+      sessionManager: {
+        getSessionFile: () => join(dir, "parent.jsonl"),
+        getSessionDir: () => dir,
+        getSessionId: () => "timeout-delivery-parent",
+      },
+    };
+    const advance = async (ms: number) => {
+      t.mock.timers.tick(ms);
+      // Drain the launch, watch and delivery promise continuations.
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    };
+    (subagentsModule as any).default(mock.api);
+    handlers.get("session_start")({}, ctx);
+    t.after(async () => {
+      handlers.get("session_shutdown")({}, ctx);
+      await advance(0);
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      for (const [key, value] of Object.entries(savedEnv)) restoreEnvVar(key, value);
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const tool = mock.registeredTools.find((tool) => tool.name ===
+      (toolName === "subagent_message" ? "subagent" : toolName));
+    const task = { agent: "scout", name: "timeout-probe", task: "probe", maxMs: 1000 };
+    const launching = tool.execute("watch-test", toolName === "subagent_parallel"
+      ? { tasks: [{ key: "probe", ...task }], worktree: false }
+      : task, undefined, undefined, ctx);
+    await advance(0);
+    const ack = await launching;
+    assert.equal(ack.details.status, "started");
+    let running = [...testApi.runningSubagents.values()][0] as any;
+    assert.ok(running);
+    const complete = (error = false) => {
+      writeFileSync(running.sessionFile, JSON.stringify({
+        type: "message", message: { role: "assistant", content: [{ type: "text", text: "Recovered final result" }] },
+      }) + "\n", { flag: "a" });
+      writeFileSync(`${running.sessionFile}.exit`, JSON.stringify(error
+        ? { type: "error", errorMessage: "Permanent provider failure" }
+        : { type: "done" }));
+    };
+    if (toolName === "subagent_message") {
+      complete();
+      await advance(1000);
+      const resumeTool = mock.registeredTools.find((tool) => tool.name === toolName);
+      const resuming = resumeTool.execute("resume-test", { name: running.name, message: "Continue" },
+        undefined, undefined, ctx);
+      await advance(0);
+      const ack = await resuming;
+      assert.equal(ack.details.status, "started");
+      running = [...testApi.runningSubagents.values()][0] as any;
+      assert.ok(running);
+      mock.sentMessages.length = 0;
+    }
+    const results = () => mock.sentMessages.filter(({ message }) =>
+      message.customType === (toolName === "subagent_parallel" ? "subagent_parallel_result" : "subagent_result"));
+    return { running, complete, results, commands, widgets, handlers, ctx, advance, api: mock.api,
+      terminalExit: (code: number) => sentinelCallbacks.at(-1)!(null, `__SUBAGENT_DONE_${running.id}_${code}__`, ""),
+      watches: () => watches, stoppedWatches: () => stoppedWatches };
+  }
+
+  for (const toolName of ["subagent", "subagent_parallel", "subagent_message"]) {
+    it(`${toolName} delivers a late result once without closing its pane or finishing its worktree`, async (t) => {
+      const h = await setup(t, toolName);
+      const worktree = join(dirname(h.ctx.sessionManager.getSessionFile()), "unfinished-worktree");
+      mkdirSync(worktree);
+      const pendingFile = join(worktree, "pending.txt");
+      writeFileSync(pendingFile, "unfinished work");
+      h.running.worktreePath = worktree;
+      h.commands.length = 0; // only observe cleanup, not launch-time git discovery
+      await h.advance(1000);
+      await h.advance(1000);
+      assert.equal(h.results().length, 1);
+      assert.match(h.results()[0].message.content, /still running.*giving up watching/s);
+      assert.match(h.results()[0].message.content, /read it, steer it/);
+      assert.doesNotMatch(h.results()[0].message.content, /failed|provider\/agent error/);
+      assert.equal(testApi.runningSubagents.has(h.running.id), true);
+      h.complete();
+      await h.advance(10_000);
+      assert.equal(h.results().length, 2, "a timed-out agent must still deliver its eventual result");
+      assert.match(h.results()[1].message.content, /Recovered final result/);
+      assert.deepEqual(h.results()[1].options, { triggerTurn: true, deliverAs: "steer" });
+      if (toolName === "subagent_parallel") assert.equal(h.results()[1].message.details.key, "probe");
+      assert.equal(testApi.runningSubagents.has(h.running.id), false);
+      assert.equal(h.widgets.at(-1), undefined, "the completed entry must leave the widget");
+      assert.equal(h.commands.some((cmd) => cmd[1] === "pane" && cmd[2] === "close"), false);
+      assert.equal(h.commands.some((cmd) => cmd[0] === "git"), false);
+      assert.equal(readFileSync(pendingFile, "utf8"), "unfinished work");
+      await h.advance(60_000);
+      assert.equal(h.results().length, 2, "reconciliation must not deliver twice");
+      assert.equal(h.watches(), h.stoppedWatches(), "no sentinel child may outlive its watch");
+    });
+  }
+
+  it("reports a resume timeout even when an interim assistant message exists", async (t) => {
+    const h = await setup(t, "subagent_message");
+    writeFileSync(h.running.sessionFile, JSON.stringify({
+      type: "message", message: { role: "assistant", content: [{ type: "text", text: "Interim progress" }] },
+    }) + "\n", { flag: "a" });
+    await h.advance(1000);
+    await h.advance(1000);
+    assert.match(h.results()[0].message.content, /still running.*giving up watching/s,
+      "interim output must not hide the timeout notice");
+  });
+
+  for (const source of ["terminal", "error", "claude"]) {
+    it(`delivers a reconciled ${source} completion without closing the pane`, async (t) => {
+      const h = await setup(t);
+      if (source === "claude") {
+        h.running.cli = "claude";
+        h.running.sentinelFile = join(dirname(h.running.sessionFile), "claude.done");
+      }
+      await h.advance(1000);
+      await h.advance(1000);
+      assert.equal(h.results().length, 1);
+      if (source === "claude") {
+        writeFileSync(h.running.sentinelFile, "Recovered Claude result");
+      } else {
+        h.complete(source === "error");
+        if (source === "terminal") {
+          rmSync(`${h.running.sessionFile}.exit`);
+          h.terminalExit(0);
+        }
+      }
+      await h.advance(9999);
+      assert.equal(h.results().length, 1, "reconciliation uses a slower polling interval");
+      await h.advance(1);
+      assert.equal(h.results().length, 2);
+      assert.match(h.results()[1].message.content, source === "claude" ? /Recovered Claude result/
+        : source === "error" ? /Permanent provider failure/ : /Recovered final result/);
+      if (source === "error") assert.equal(h.results()[1].message.details.errorMessage, "Permanent provider failure");
+      assert.equal(testApi.runningSubagents.has(h.running.id), false);
+      assert.equal(h.commands.some((cmd) => cmd[1] === "pane" && cmd[2] === "close"), false);
+      assert.equal(h.watches(), h.stoppedWatches());
+    });
+  }
+
+  for (const boundary of ["session_shutdown", "module abort"]) {
+    it(`stops reconciling on ${boundary} without closing panes or delivering stale results`, async (t) => {
+      const h = await setup(t);
+      h.running.worktreePath = join(h.ctx.cwd, "unfinished-worktree");
+      await h.advance(1000);
+      await h.advance(1000);
+      assert.equal(h.watches(), 2, "the reconcile sentinel watch must be armed");
+      if (boundary === "session_shutdown") h.handlers.get(boundary)({}, h.ctx);
+      else (globalThis as any)[Symbol.for("pi-subagents/poll-abort-controller")].abort();
+      await h.advance(0);
+      assert.equal(h.watches(), h.stoppedWatches());
+      h.complete();
+      await h.advance(100_000);
+      assert.equal(h.watches(), 2, "shutdown must not re-arm watchers or retry timers");
+      assert.equal(h.results().length, 1, "shutdown must not deliver a cancelled result into an old session");
+      assert.equal(testApi.runningSubagents.has(h.running.id), false);
+      assert.equal(h.commands.some((cmd) => cmd[1] === "pane" && cmd[2] === "close"), false);
+      assert.equal(h.commands.some((cmd) => cmd[0] === "git"), false);
+    });
+  }
+
+  it("keeps reconciling if delivery of the timeout notice throws", async (t) => {
+    const h = await setup(t);
+    const sendMessage = h.api.sendMessage;
+    h.api.sendMessage = (message: any, options: any) => {
+      if (/giving up watching/.test(message.content)) throw new Error("Timeout notice delivery failed");
+      sendMessage(message, options);
+    };
+    await h.advance(1000);
+    await h.advance(1000);
+    h.complete();
+    await h.advance(10_000);
+    assert.ok(h.results().some(({ message }: any) => /Recovered final result/.test(message.content)),
+      "a failed notice must not orphan the completion watch");
+    assert.equal(testApi.runningSubagents.has(h.running.id), false);
+  });
+
+  it("reconciles the replacement run when a provider retry later times out", async (t) => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeModelsFile(globalDir, { providers: { "ai-gw-fixture": { models: [{ id: "retry-model" }] } } });
+      const h = await setup(t);
+      writeFileSync(`${h.running.sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "503 unavailable" }));
+      await h.advance(1000);
+      await h.advance(0);
+      const replacement = [...testApi.runningSubagents.values()][0] as any;
+      assert.ok(replacement);
+      assert.notEqual(replacement.id, h.running.id);
+      await h.advance(1000);
+      await h.advance(1000);
+      assert.equal(h.results().length, 1);
+      const closesBeforeCompletion = h.commands.filter((cmd) => cmd[1] === "pane" && cmd[2] === "close").length;
+      writeFileSync(replacement.sessionFile, JSON.stringify({
+        type: "message", message: { role: "assistant", content: [{ type: "text", text: "Replacement result" }] },
+      }) + "\n", { flag: "a" });
+      writeFileSync(`${replacement.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      await h.advance(10_000);
+      assert.equal(h.results().length, 2, "the replacement, not the failed original, must be reconciled");
+      assert.match(h.results()[1].message.content, /Replacement result/);
+      assert.equal(testApi.runningSubagents.has(replacement.id), false);
+      assert.equal(h.commands.filter((cmd) => cmd[1] === "pane" && cmd[2] === "close").length, closesBeforeCompletion);
+    });
+  });
+
+  it("ordinary completion still closes its pane", async (t) => {
+    const h = await setup(t);
+    h.complete();
+    await h.advance(1000);
+    assert.equal(h.results().length, 1);
+    assert.match(h.results()[0].message.content, /Recovered final result/);
+    assert.equal(testApi.runningSubagents.has(h.running.id), false);
+    assert.equal(h.commands.filter((cmd) => cmd[1] === "pane" && cmd[2] === "close").length, 1);
+    assert.equal(h.widgets.at(-1), undefined);
   });
 });
 

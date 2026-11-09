@@ -883,6 +883,7 @@ function resolveResultPresentation(
     | "sessionFile"
     | "sessionId"
     | "errorMessage"
+    | "timedOut"
     | "structuredOutputError"
     | "worktreeNote"
     | "worktreeBranch"
@@ -897,6 +898,12 @@ function resolveResultPresentation(
   // Where a worktree subagent's work went. Like schemaNote below: `details`
   // never reaches the model, so the branch name has to be in the text.
   const worktreeNote = result.worktreeNote ? `\n\n${result.worktreeNote}` : "";
+
+  if (result.timedOut) {
+    return {
+      content: `Sub-agent "${name}" is still running (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`,
+    };
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -964,6 +971,8 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  /** Run whose watch expired. A provider retry may have replaced the original. */
+  timedOut?: RunningSubagent;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
@@ -2544,18 +2553,42 @@ function pickRetryFallbackModel(
   }
 }
 
+/** Deliver the timeout notice, then keep observing without taking ownership of cleanup. */
+async function watchSubagentResults(
+  running: RunningSubagent,
+  signal: AbortSignal,
+  deliver: (result: SubagentResult) => void,
+  retry?: { ctx: SubagentSpawnCtx; params: Static<typeof SubagentParams>; retryCount: number },
+): Promise<void> {
+  const watchSignal = AbortSignal.any([signal, getModuleAbortSignal()]);
+  const result = await watchSubagent(running, watchSignal, retry);
+  if (watchSignal.aborted) return;
+  try {
+    deliver(result);
+  } catch (err) {
+    if (!result.timedOut) throw err;
+    // A failed notice must not leave a live subagent without a completion watch.
+    console.error(`Subagent "${running.name}" timeout notice could not be delivered: ${err}`);
+  }
+  if (!result.timedOut) return;
+
+  const completion = await watchSubagent(result.timedOut, watchSignal, undefined, true);
+  if (!watchSignal.aborted) deliver(completion);
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
   retry?: { ctx: SubagentSpawnCtx; params: Static<typeof SubagentParams>; retryCount: number },
+  reconcile = false,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
-      interval: 1000,
+      interval: reconcile ? 10_000 : 1000,
       doneId: running.id,
-      maxMs: resolveDispatchMaxMs(running.maxMs),
+      maxMs: reconcile ? Infinity : resolveDispatchMaxMs(running.maxMs),
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
@@ -2576,10 +2609,10 @@ async function watchSubagent(
     // runningSubagents too, so the widget keeps showing it and
     // subagent_message can still reach it.
     if (result.reason === "timeout") {
-      finishHerdrAgentState(running);
       return {
         name,
         task,
+        timedOut: running,
         summary:
           `${result.errorMessage} It is still running in its pane — read it, steer it with ` +
           `subagent_message, or close the pane when you are done with it.`,
@@ -2596,6 +2629,7 @@ async function watchSubagent(
     // Max one retry per spawn; resume (no `retry`) never retries.
     if (
       result.reason === "error" &&
+      !reconcile &&
       retry &&
       retry.retryCount === 0 &&
       isTransientProviderError(result.errorMessage) &&
@@ -2667,8 +2701,8 @@ async function watchSubagent(
       }
 
       finishHerdrAgentState(running);
-      closeSurface(surface);
-      const worktree = finishRunningWorktree(running);
+      if (!reconcile) closeSurface(surface);
+      const worktree = reconcile ? {} : finishRunningWorktree(running);
       runningSubagents.delete(running.id);
 
       return {
@@ -2698,8 +2732,8 @@ async function watchSubagent(
     const abortedRun =
       !!result.errorMessage && /abort/i.test(result.errorMessage) && result.reason === "error";
     finishHerdrAgentState(running, abortedRun ? "cancelled" : undefined);
-    closeSurface(surface);
-    const worktree = finishRunningWorktree(running);
+    if (!reconcile) closeSurface(surface);
+    const worktree = reconcile ? {} : finishRunningWorktree(running);
     runningSubagents.delete(running.id);
 
     return {
@@ -2718,10 +2752,10 @@ async function watchSubagent(
   } catch (err: any) {
     try {
       finishHerdrAgentState(running);
-      closeSurface(surface);
+      if (!reconcile) closeSurface(surface);
     } catch {}
-    // A cancelled or crashed subagent may still have left work behind.
-    const worktree = finishRunningWorktree(running);
+    // Timed-out panes and worktrees remain under the user's control, even on abort.
+    const worktree = reconcile ? {} : finishRunningWorktree(running);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -2942,8 +2976,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal, { ctx, params, retryCount: 0 })
-          .then((result) => {
+        watchSubagentResults(
+          running,
+          watcherAbort.signal,
+          (result) => {
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name, parentArtifactDir);
@@ -2972,7 +3008,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
+          },
+          { ctx, params, retryCount: 0 },
+        )
           .catch((err) => {
             updateWidget();
             pi.sendMessage(
@@ -3410,12 +3448,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+        watchSubagentResults(
+          running,
+          watcherAbort.signal,
+          (result) => {
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
+            const summary = result.timedOut ? result.summary : findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
                 : result.exitCode !== 0
@@ -3445,7 +3485,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
+          },
+        )
           .catch((err) => {
             updateWidget();
             pi.sendMessage(
@@ -3619,8 +3660,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             // Fire-and-forget watcher. The result is delivered as a steer
             // message with the task key in details so the orchestrator can
             // correlate it back to the original batch.
-            watchSubagent(running, watcherAbort.signal, { ctx, params: taskParams, retryCount: 0 })
-              .then((result) => {
+            watchSubagentResults(
+              running,
+              watcherAbort.signal,
+              (result) => {
                 updateWidget();
                 const presentation = resolveResultPresentation(result, running.name, parentArtifactDir);
                 pi.sendMessage(
@@ -3643,7 +3686,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   },
                   { triggerTurn: true, deliverAs: "steer" },
                 );
-              })
+              },
+              { ctx, params: taskParams, retryCount: 0 },
+            )
               .catch((err) => {
                 updateWidget();
                 pi.sendMessage(
