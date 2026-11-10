@@ -74,6 +74,7 @@ import {
 import { createWorktree, finishWorktree, isGitRepo, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 import { HUMAN_WAIT_LEASE_MS, readHumanWait, readHumanWaitOwner, writeHumanWaitOwner } from "./human-wait.ts";
+import { SEARCH_ROOTS_ENV, computeSearchRoots, decodeSearchRoots, encodeSearchRoots, narrowToInherited, resumeSearchRoots } from "./search-bounds.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -103,6 +104,13 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+}
+
+/** Tool-result note for search roots a bounded launcher could not pass on. */
+function searchRootsDroppedNote(dropped: string[] | undefined, key?: string): string {
+  if (!dropped || dropped.length === 0) return "";
+  const shown = dropped.slice(0, 8).join(", ") + (dropped.length > 8 ? `, and ${dropped.length - 8} more` : "");
+  return ` Search roots outside this session's own bound were not passed on${key ? ` for ${key}` : ""}: ${shown}.`;
 }
 
 const SubagentParams = Type.Object({
@@ -144,6 +152,14 @@ const SubagentParams = Type.Object({
         "this subagent before reporting it as still-running; use 2700000 (45 minutes) or 3600000 " +
         "(60 minutes) for verification/adversarial fleets. Defaults to PI_SUBAGENT_MAX_MS, then the " +
         "6-hour fork default. The expiry is non-killing: the pane and worktree remain for manual steering.",
+    }),
+  ),
+  searchRoots: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Extra directories or files the child's grep and find may search, beyond its cwd, the temp " +
+        "directory and the paths named in the task. Use only to authorize wider discovery (for example " +
+        "the home directory). Child searches outside these roots are refused and every search has a deadline.",
     }),
   ),
 });
@@ -1035,6 +1051,8 @@ interface RunningSubagent {
    * the six-hour default — see resolveDispatchMaxMs.
    */
   maxMs?: number;
+  /** Search roots dropped because they were outside the launcher's own roots. */
+  searchRootsDropped?: string[];
   /**
    * Session lines written by the seed, not by the child. Only non-zero for a
    * `fork` spawn, whose seed carries the parent's own assistant messages.
@@ -2262,6 +2280,14 @@ async function launchSubagentInner(
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
+  // A bounded launcher (itself a child with PI_SUBAGENT_SEARCH_ROOTS) can only
+  // pass on roots inside its own. Grants and task paths outside are dropped
+  // and reported in the tool result.
+  const searchRootsDecision = narrowToInherited(
+    computeSearchRoots({ cwd: effectiveCwdForLaunch ?? ctx.cwd, task: params.task, explicit: params.searchRoots }),
+    decodeSearchRoots(process.env[SEARCH_ROOTS_ENV]),
+    { worktreePath, worktreeSource: worktreePath ? targetCwdForSession : undefined },
+  );
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
@@ -2272,6 +2298,7 @@ async function launchSubagentInner(
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwdForLaunch ?? null,
+    searchRoots: searchRootsDecision.roots,
     agentDir: resolvedAgentDir,
     outputSchema: agentDefs?.outputSchema ?? null,
     worktree: agentDefs?.worktree ?? false,
@@ -2292,6 +2319,11 @@ async function launchSubagentInner(
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+  }
+  // Always set, even when empty: an empty list is a bound that allows nothing. A missing variable
+  // would leave the child unbounded.
+  if (Array.isArray(loadout.searchRoots)) {
+    envParts.push(`${SEARCH_ROOTS_ENV}=${shellEscape(encodeSearchRoots(loadout.searchRoots))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
@@ -2379,6 +2411,7 @@ async function launchSubagentInner(
     ...(agentDefs?.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
     ...(params.maxMs !== undefined ? { maxMs: params.maxMs } : {}),
     ...(seededLines > 0 ? { seededLines } : {}),
+    ...(searchRootsDecision.dropped.length > 0 ? { searchRootsDropped: searchRootsDecision.dropped } : {}),
   };
 
   runningSubagents.set(id, running);
@@ -3171,7 +3204,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Until then, move on to other work or tell the user you're waiting.` +
+                searchRootsDroppedNote(running.searchRootsDropped),
             },
           ],
           details: {
@@ -3519,6 +3553,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (loadout.agent) {
           resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
         }
+        {
+          // A bounded resumer cannot replay roots wider than its own, and a snapshot written before
+          // search bounds existed still gets a bound.
+          const resumeRoots = resumeSearchRoots(
+            loadout.searchRoots,
+            decodeSearchRoots(process.env[SEARCH_ROOTS_ENV]),
+            resumeCwd ?? ctx.cwd,
+          );
+          resumeEnvParts.push(`${SEARCH_ROOTS_ENV}=${shellEscape(encodeSearchRoots(resumeRoots))}`);
+        }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -3692,6 +3736,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             tools: Type.Optional(Type.String({ description: "Additional tools to grant this task beyond the agent's fixed loadout, comma-separated (e.g. 'mcp__slack__*'). Merged with the agent's tools; no effect on unrestricted agents." })),
             cwd: Type.Optional(Type.String({ description: "Working directory override." })),
             maxMs: Type.Optional(Type.Number({ description: "Optional watcher bound for this dispatch in milliseconds (e.g. 2700000 for 45 minutes). Defaults to PI_SUBAGENT_MAX_MS, then the 6-hour fork default. Non-killing: the pane and worktree remain." })),
+            searchRoots: Type.Optional(Type.Array(Type.String(), { description: "Extra directories or files this child's grep and find may search beyond its cwd, the temp directory and the task's paths. Use only to authorize wider discovery." })),
             worktree: Type.Optional(Type.Boolean({ description: "Per-task worktree override. Default is auto: an isolated git worktree when the batch has multiple tasks and the agent can write files." })),
           }),
         ),
@@ -3758,7 +3803,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionId(),
         );
 
-        const launched: Array<{ key: string; name: string; agent: string }> = [];
+        const launched: Array<{ key: string; name: string; agent: string; searchRootsDropped?: string[] }> = [];
 
         // Tool loadouts for the auto-worktree decision: a task whose agent can
         // write files is isolated from its siblings by default.
@@ -3786,7 +3831,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               agentWriteCapable: isWriteCapableAgent(agentToolsMap.get(t.agent)),
               cwdIsGitRepo: isGitRepo(t.cwd ?? ctx.cwd),
             });
-            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd, maxMs: t.maxMs, tools: t.tools };
+            const taskParams = { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd, maxMs: t.maxMs, tools: t.tools, searchRoots: t.searchRoots };
             const running = await launchSubagent(
               taskParams,
               ctx,
@@ -3845,7 +3890,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 );
               });
 
-            launched.push({ key: t.key, name: uniqueName, agent: t.agent });
+            launched.push({ key: t.key, name: uniqueName, agent: t.agent,
+              ...(running.searchRootsDropped ? { searchRootsDropped: running.searchRootsDropped } : {}) });
           } finally {
             reservedNames.delete(uniqueName);
           }
@@ -3859,7 +3905,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               text:
                 `Spawned ${launched.length} subagents in parallel: ${namesList}. ` +
                 `Each result will be delivered as a steer message with its key when it finishes. ` +
-                `Do NOT poll or wait — move on to other work or end your turn.`,
+                `Do NOT poll or wait — move on to other work or end your turn.` +
+                launched.map((l) => searchRootsDroppedNote(l.searchRootsDropped, l.key)).join(""),
             },
           ],
           details: { launched, status: "started" },

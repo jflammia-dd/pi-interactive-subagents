@@ -2654,7 +2654,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/tools/cwd/maxMs optional, no override knobs", () => {
+  it("exposes a debloated schema: agent+task required, name/model/tools/cwd/maxMs/searchRoots optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2664,8 +2664,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "maxMs", "model", "name", "task", "tools"],
-      "only agent/task/name/model/tools/cwd/maxMs should remain",
+      ["agent", "cwd", "maxMs", "model", "name", "searchRoots", "task", "tools"],
+      "only agent/task/name/model/tools/cwd/maxMs/searchRoots should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -5875,6 +5875,184 @@ describe("child human wait reporting", () => {
         }
         f.close();
       }
+    });
+  });
+
+  for (const path of ["launch", "resume", "resume-legacy"]) it(`search roots reach the child environment on ${path}`, async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "scout", "name: scout\ndescription: Test scout\ntools: read, grep, find");
+      const f = fixture();
+      const shutdown: Function[] = [];
+      try {
+        writeFileSync(join(f.dir, "bin", "herdr"), [
+          "#!/usr/bin/env node",
+          `if (process.argv[3] === 'split') console.log(JSON.stringify({ result: { pane: { pane_id: 'w9S:pE' } } }));`,
+        ].join("\n"), { mode: 0o755 });
+        const supplied = join(f.dir, "supplied", "report.md");
+        mkdirSync(dirname(supplied), { recursive: true });
+        writeFileSync(supplied, "token\n");
+        const parent = join(f.dir, "parent.jsonl");
+        writeFileSync(parent, JSON.stringify({ type: "session", id: "parent", cwd: projectDir }) + "\n");
+        const ctx = { cwd: projectDir, hasUI: false, sessionManager: {
+          getSessionDir: () => f.dir, getSessionId: () => "parent", getSessionFile: () => parent,
+        } };
+        const scripts = join(f.dir, "artifacts", "parent", "subagent-scripts");
+        if (path === "launch") {
+          await testApi.launchSubagent({ agent: "scout", name: "bounded-child", task: `Search ${supplied} for the token.`,
+            searchRoots: ["/opt/explicit-grant"] }, ctx, { surface: "w9S:pE" });
+        } else {
+          const session = join(f.dir, "resume.jsonl");
+          writeFileSync(session, JSON.stringify({ type: "session", id: "resume", cwd: projectDir }) + "\n");
+          writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+          registerName(join(f.dir, "artifacts", "parent"), "bounded-child", { sessionFile: session, sessionId: "resume" });
+          writeSubagentLoadout(session, { agent: "scout", toolAllowlist: "read,grep,find", model: null,
+            thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+            autoExit: true, cwd: projectDir, agentDir: process.env.PI_CODING_AGENT_DIR ?? null,
+            // A snapshot written before search bounds existed has no searchRoots field.
+            ...(path === "resume" ? { searchRoots: [supplied, "/opt/explicit-grant"] } : {}) } as any);
+          const { api, registeredTools } = createMockExtensionApi();
+          api.on = (name: string, fn: Function) => { if (name === "session_shutdown") shutdown.push(fn); };
+          (subagentsModule as any).default(api);
+          const result = await registeredTools.find((t) => t.name === "subagent_message")!.execute(
+            "resume-call", { name: "bounded-child", message: "continue" }, undefined, undefined, ctx);
+          assert.equal(result.details?.status, "started", "fake resume must reach the real launch path");
+          await new Promise<void>((done) => setImmediate(done));
+        }
+        const script = readdirSync(scripts).map((n) => readFileSync(join(scripts, n), "utf8")).find((s) => s.includes("bounded-child"));
+        assert.ok(script, "launch script written");
+        const m = /PI_SUBAGENT_SEARCH_ROOTS='([^']+)'/.exec(script!);
+        assert.ok(m, `${path} must pass PI_SUBAGENT_SEARCH_ROOTS to the child`);
+        const roots: string[] = JSON.parse(m![1]).roots;
+        const realSupplied = fs.realpathSync(supplied);
+        if (path === "resume-legacy") {
+          assert.ok(roots.length > 0, "a legacy snapshot is still bounded");
+          assert.ok(roots.includes(fs.realpathSync(projectDir)), "the resumed child's cwd is a root");
+        } else {
+          assert.ok(roots.includes(realSupplied) || roots.includes(supplied), "the supplied file is a root");
+          assert.ok(roots.includes("/opt/explicit-grant"), "an explicit grant is a root");
+        }
+        assert.ok(!roots.includes(fs.realpathSync(homedir())), "home is never an implicit root");
+      } finally {
+        for (const fn of shutdown) fn({ reason: "quit" }, {});
+        for (const [id, running] of testApi.runningSubagents) {
+          running.abortController?.abort();
+          testApi.runningSubagents.delete(id);
+        }
+        f.close();
+      }
+    });
+  });
+
+  async function withLaunchFixture(run: (h: { f: any; ctx: any; projectDir: string; scripts: string; shutdown: Function[] }) => Promise<void>) {
+    await withIsolatedAgentEnv(async ({ projectDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "scout", "name: scout\ndescription: Test scout\ntools: read, grep, find");
+      const f = fixture();
+      const shutdown: Function[] = [];
+      try {
+        writeFileSync(join(f.dir, "bin", "herdr"), [
+          "#!/usr/bin/env node",
+          `if (process.argv[3] === 'split') console.log(JSON.stringify({ result: { pane: { pane_id: 'w9S:pE' } } }));`,
+        ].join("\n"), { mode: 0o755 });
+        const parent = join(f.dir, "parent.jsonl");
+        writeFileSync(parent, JSON.stringify({ type: "session", id: "parent", cwd: projectDir }) + "\n");
+        const ctx = { cwd: projectDir, hasUI: false, sessionManager: {
+          getSessionDir: () => f.dir, getSessionId: () => "parent", getSessionFile: () => parent,
+        } };
+        await run({ f, ctx, projectDir, scripts: join(f.dir, "artifacts", "parent", "subagent-scripts"), shutdown });
+      } finally {
+        for (const fn of shutdown) fn({ reason: "quit" }, {});
+        for (const [id, running] of testApi.runningSubagents) {
+          running.abortController?.abort();
+          testApi.runningSubagents.delete(id);
+        }
+        f.close();
+      }
+    });
+  }
+  const scriptRoots = (scripts: string, name: string): string[] => {
+    const script = readdirSync(scripts).filter((n) => n.startsWith(`${name}-`)).map((n) => readFileSync(join(scripts, n), "utf8")).pop();
+    assert.ok(script, `launch script for ${name}`);
+    const m = /PI_SUBAGENT_SEARCH_ROOTS='([^']+)'/.exec(script!);
+    assert.ok(m, `${name} must carry PI_SUBAGENT_SEARCH_ROOTS`);
+    return JSON.parse(m![1]).roots;
+  };
+  const withEnv = async (key: string, value: string, fn: () => Promise<void>) => {
+    const saved = process.env[key];
+    process.env[key] = value;
+    try { await fn(); } finally { if (saved === undefined) delete process.env[key]; else process.env[key] = saved; }
+  };
+
+  it("RED/GREEN: a bounded launcher cannot widen a grandchild on launch", async () => {
+    await withLaunchFixture(async ({ f, ctx, projectDir, scripts }) => {
+      const inside = fs.realpathSync(projectDir);
+      const outsideFile = join(f.dir, "outside", "secret.md");
+      mkdirSync(dirname(outsideFile), { recursive: true });
+      writeFileSync(outsideFile, "x\n");
+      await withEnv("PI_SUBAGENT_SEARCH_ROOTS", JSON.stringify({ v: 1, roots: [inside] }), async () => {
+        const running = await testApi.launchSubagent({ agent: "scout", name: "grandchild", task: `Search ${outsideFile} and ${inside}.`,
+          searchRoots: ["~", "/opt/wider"] }, ctx, { surface: "w9S:pE" });
+        const roots = scriptRoots(scripts, "grandchild");
+        for (const r of roots) assert.ok(r === inside || r.startsWith(inside + "/"), `root ${r} must stay inside ${inside}`);
+        assert.ok(!roots.includes(fs.realpathSync(homedir())));
+        assert.ok(running.searchRootsDropped?.includes(fs.realpathSync(homedir())), "dropped grants are reported");
+        assert.ok(running.searchRootsDropped?.includes(fs.realpathSync(outsideFile)));
+      });
+    });
+  });
+
+  it("RED/GREEN: a bounded resumer cannot replay wider roots", async () => {
+    await withLaunchFixture(async ({ f, ctx, projectDir, scripts, shutdown }) => {
+      const inside = fs.realpathSync(projectDir);
+      const session = join(f.dir, "resume.jsonl");
+      writeFileSync(session, JSON.stringify({ type: "session", id: "resume", cwd: projectDir }) + "\n");
+      writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+      registerName(join(f.dir, "artifacts", "parent"), "bounded-resume", { sessionFile: session, sessionId: "resume" });
+      writeSubagentLoadout(session, { agent: "scout", toolAllowlist: "read,grep,find", model: null,
+        thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+        autoExit: true, cwd: projectDir, agentDir: process.env.PI_CODING_AGENT_DIR ?? null,
+        searchRoots: [inside, "/opt/wider"] } as any);
+      await withEnv("PI_SUBAGENT_SEARCH_ROOTS", JSON.stringify({ v: 1, roots: [inside] }), async () => {
+        const { api, registeredTools } = createMockExtensionApi();
+        api.on = (name: string, fn: Function) => { if (name === "session_shutdown") shutdown.push(fn); };
+        (subagentsModule as any).default(api);
+        const result = await registeredTools.find((t) => t.name === "subagent_message")!.execute(
+          "resume-call", { name: "bounded-resume", message: "continue" }, undefined, undefined, ctx);
+        assert.equal(result.details?.status, "started");
+        await new Promise<void>((done) => setImmediate(done));
+      });
+      assert.deepEqual(scriptRoots(scripts, "bounded-resume"), [inside]);
+    });
+  });
+
+  for (const bad of ["garbage", "", '{"v":1,"roots":[]}']) {
+    it(`a launcher whose roots variable is unusable (${JSON.stringify(bad)}) still hands its grandchild a closed bound`, async () => {
+      await withLaunchFixture(async ({ ctx, scripts }) => {
+        await withEnv("PI_SUBAGENT_SEARCH_ROOTS", bad, async () => {
+          await testApi.launchSubagent({ agent: "scout", name: "closed-grandchild", task: "look around",
+            searchRoots: ["/opt/wider"] }, ctx, { surface: "w9S:pE" });
+        });
+        // The variable must be present and empty. A missing variable would leave the child unbounded.
+        assert.deepEqual(scriptRoots(scripts, "closed-grandchild"), []);
+      });
+    });
+  }
+
+  it("RED/GREEN: subagent_parallel passes each task's searchRoots through", async () => {
+    await withLaunchFixture(async ({ ctx, projectDir, scripts, shutdown }) => {
+      const { api, registeredTools } = createMockExtensionApi();
+      api.on = (name: string, fn: Function) => { if (name === "session_shutdown") shutdown.push(fn); };
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((t) => t.name === "subagent_parallel")!;
+      const r = await tool.execute("par", { worktree: false, tasks: [
+        { key: "a", agent: "scout", name: "par-granted", task: "look", searchRoots: ["/opt/parallel-grant"] },
+        { key: "b", agent: "scout", name: "par-plain", task: "look" },
+      ] }, undefined, undefined, ctx);
+      assert.equal(r.details?.status, "started", JSON.stringify(r.content));
+      const granted = scriptRoots(scripts, "par-granted");
+      const plain = scriptRoots(scripts, "par-plain");
+      assert.ok(granted.includes("/opt/parallel-grant"), JSON.stringify(granted));
+      assert.ok(!plain.includes("/opt/parallel-grant"));
+      assert.ok(plain.includes(fs.realpathSync(projectDir)), "a task without searchRoots still gets implicit roots");
     });
   });
 

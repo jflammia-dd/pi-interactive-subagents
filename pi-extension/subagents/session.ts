@@ -212,6 +212,11 @@ export interface SubagentLoadout {
   autoExit: boolean;
   /** Working directory the subagent ran in, or null. */
   cwd: string | null;
+  /**
+   * Search roots the child's grep and find were bounded to (search-bounds.ts),
+   * replayed on resume. Absent in snapshots written before the bound existed.
+   */
+  searchRoots?: string[] | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
   /** JSON Schema object for structured output validation, or null. */
