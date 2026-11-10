@@ -5648,7 +5648,7 @@ describe("per-dispatch tool grants and parallel worktree defaults", () => {
 import fs from "node:fs";
 import { syncBuiltinESMExports as syncWaitFilesystemExports } from "node:module";
 import { readHumanWait } from "../pi-extension/subagents/human-wait.ts";
-import { reportAgentState, releaseAgentState } from "../pi-extension/subagents/herdr.ts";
+import { reportAgentState, releaseAgentState, __backgroundAgentStateTest__ } from "../pi-extension/subagents/herdr.ts";
 
 describe("child human wait reporting", () => {
   const testApi = (subagentsModule as any).__test__;
@@ -5731,7 +5731,7 @@ describe("child human wait reporting", () => {
     writeFileSync(join(dir, `${value.runningChildId}.json.owner`), JSON.stringify(value), { mode: 0o600 });
   }
 
-  function recovery(f: ReturnType<typeof fixture>, session = "parent") {
+  async function recovery(f: ReturnType<typeof fixture>, session = "parent") {
     let tick: () => void = () => {};
     const originalSet = globalThis.setInterval;
     const originalClear = globalThis.clearInterval;
@@ -5752,8 +5752,9 @@ describe("child human wait reporting", () => {
       globalThis.setInterval = originalSet;
       globalThis.clearInterval = originalClear;
     }
+    await __backgroundAgentStateTest__.drain();
     return {
-      tick(ms = 1000) { clock += ms; tick(); },
+      async tick(ms = 1000) { clock += ms; tick(); await __backgroundAgentStateTest__.drain(); },
       close() { try { stop?.(); } finally { Date.now = originalNow; } },
     };
   }
@@ -5766,15 +5767,15 @@ describe("child human wait reporting", () => {
     return dir;
   }
 
-  it("fix2 accepts letter-bearing pane ids in child and recovered paths", () => {
+  it("fix2 accepts letter-bearing pane ids in child and recovered paths", async () => {
     for (const pane of ["w9P:pE", "w9S:p2", "wA1:p1", "w90:pX"]) {
       const f = fixture(true, pane);
-      let r: ReturnType<typeof recovery> | undefined;
+      let r: Awaited<ReturnType<typeof recovery>> | undefined;
       try {
         f.emit("ui_prompt_start", { kind: "confirm" });
         assert.equal(f.observe(), "blocked", `real pane ${pane} must report blocked`);
         copyRecovery(f);
-        r = recovery(f);
+        r = await recovery(f);
         assert.equal(f.calls().filter((a) => a[1] === "report-agent").length, 2, "letter-bearing orphan must recover");
       } finally { r?.close(); f.close(); }
     }
@@ -5806,16 +5807,16 @@ describe("child human wait reporting", () => {
     });
   }
 
-  it("fix2 ignores a forged orphan pane and name without parent ownership", () => {
+  it("fix2 ignores a forged orphan pane and name without parent ownership", async () => {
     const f = fixture();
-    let r: ReturnType<typeof recovery> | undefined;
+    let r: Awaited<ReturnType<typeof recovery>> | undefined;
     try {
       f.emit("ui_prompt_start", { kind: "input" });
       const dir = copyRecovery(f);
       const file = join(dir, "child.json.wait");
       const wait = JSON.parse(readFileSync(file, "utf8"));
       writeFileSync(file, JSON.stringify({ ...wait, pane: "w3:p3", name: "victim" }));
-      r = recovery(f);
+      r = await recovery(f);
       assert.equal(f.calls().length, 0, "forged pane must not receive parent authority");
     } finally { r?.close(); f.close(); }
   });
@@ -6082,9 +6083,9 @@ describe("child human wait reporting", () => {
     });
   });
 
-  it("fix2 backs off failed live and orphan reports with an injected clock", () => {
+  it("fix2 backs off failed live and orphan reports with an injected clock", async () => {
     const f = fixture();
-    let r: ReturnType<typeof recovery> | undefined;
+    let r: Awaited<ReturnType<typeof recovery>> | undefined;
     try {
       f.emit("ui_prompt_start", { kind: "confirm" });
       writeFileSync(join(f.dir, "ambiguous-report"), "fail after acceptance");
@@ -6103,33 +6104,33 @@ describe("child human wait reporting", () => {
       writeFileSync(waitFile, JSON.stringify(wait));
       copyRecovery(f);
       writeFileSync(join(f.dir, "ambiguous-report"), "fail orphan acknowledgement");
-      r = recovery(f);
+      r = await recovery(f);
       const n = f.calls().length;
-      r.tick();
+      await r.tick();
       assert.equal(f.calls().length, n, "orphan report must also back off");
-      r.tick(4000);
+      await r.tick(4000);
       assert.equal(f.calls().length, n + 1, "failed orphan report must actually retry");
       rmSync(join(f.dir, "ambiguous-report"));
       const recoveredWait = join(f.dir, "artifacts", "parent", "subagent-activity", "child.json.wait");
       writeFileSync(recoveredWait, JSON.stringify({ ...wait, updatedAt: Date.now() + 5000 }));
-      r.tick(5000);
+      await r.tick(5000);
       const successful = f.calls().length;
-      r.tick();
+      await r.tick();
       assert.equal(f.calls().length, successful, "successful orphan report must be cached");
     } finally { r?.close(); f.close(); }
   });
 
-  it("fix2 defers lease expiry for one wake tick only", () => {
+  it("fix2 defers lease expiry for one wake tick only", async () => {
     const f = fixture();
-    let r: ReturnType<typeof recovery> | undefined;
+    let r: Awaited<ReturnType<typeof recovery>> | undefined;
     try {
       f.emit("ui_prompt_start", { kind: "confirm" });
       copyRecovery(f);
-      r = recovery(f);
-      r.tick(30000);
+      r = await recovery(f);
+      await r.tick(30000);
       const states = () => f.calls().filter((a) => a[1] === "report-agent").map((a) => a[a.indexOf("--state") + 1]);
       assert.deepEqual(states(), ["blocked"], "wake tick must not clear an expired lease before heartbeat renewal");
-      r.tick();
+      await r.tick();
       assert.equal(states().at(-1), "working", "expiry must resume on the following tick");
     } finally { r?.close(); f.close(); }
   });
@@ -6145,21 +6146,21 @@ describe("child human wait reporting", () => {
     } finally { f.close(); }
   });
 
-  it("fix2 cleans only trusted dead expired or cleared waits from sibling sessions", () => {
+  it("fix2 cleans only trusted dead expired or cleared waits from sibling sessions", async () => {
     const f = fixture(true, "w9S:pE");
-    let r: ReturnType<typeof recovery> | undefined;
+    let r: Awaited<ReturnType<typeof recovery>> | undefined;
     try {
       f.emit("ui_prompt_start", { kind: "input" });
       const dir = copyRecovery(f, "older");
       const file = join(dir, "child.json.wait");
       const wait = JSON.parse(readFileSync(file, "utf8"));
-      r = recovery(f, "fresh");
+      r = await recovery(f, "fresh");
       assert.equal(f.calls().length, 0, "fresh session must not take authority over a live sibling wait");
       writeFileSync(file, JSON.stringify({ ...wait, count: 0 }));
-      r.tick();
+      await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "fresh session must release a trusted closed wait");
       assert.ok(f.calls().every((a) => a[2] === "w9S:pE"));
-      r.tick();
+      await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "cleared sibling must not be released repeatedly");
       for (const [id, patch] of [["expired", { updatedAt: Date.now() - 9000 }], ["dead", { pid: 2147483647 }]] as const) {
         owner(dir, f, { runningChildId: id, startedAt: Date.now() - 20000 });
@@ -6167,7 +6168,7 @@ describe("child human wait reporting", () => {
           startedAt: Date.now() - 20000, ...patch }));
       }
       writeFileSync(join(dir, "forged.json.wait"), JSON.stringify({ ...wait, runningChildId: "forged", count: 0, pane: "w90:pX" }));
-      r.tick();
+      await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 3, "trusted expired and dead waits must clear");
       assert.ok(f.calls().every((a) => a[2] !== "w90:pX"), "unowned sibling must not be released");
     } finally { r?.close(); f.close(); }
@@ -6210,17 +6211,17 @@ describe("child human wait reporting", () => {
     } finally { Date.now = originalNow; f.close(); }
   });
 
-  it("fix2 stops recovered authority and does not reconcile a live runner twice", () => {
+  it("fix2 stops recovered authority and does not reconcile a live runner twice", async () => {
     const f = fixture();
-    let r: ReturnType<typeof recovery> | undefined;
+    let r: Awaited<ReturnType<typeof recovery>> | undefined;
     try {
       f.emit("ui_prompt_start", { kind: "confirm" });
       copyRecovery(f);
       testApi.runningSubagents.set("child", f.running);
-      r = recovery(f);
+      r = await recovery(f);
       assert.equal(f.calls().length, 1, "only the live observer must report this child");
       testApi.runningSubagents.delete("child");
-      r.tick();
+      await r.tick();
       const n = f.calls().length;
       r.close(); r = undefined;
       assert.ok(f.calls().length > n && f.calls().at(-1)[1] === "release-agent", "stop must release recovered authority");
@@ -6566,6 +6567,7 @@ describe("child human wait reporting", () => {
       copy();
       (subagentsModule as any).default(api);
       fire("session_start");
+      await __backgroundAgentStateTest__.drain();
       const lastState = () => {
         const report = f.calls().filter((args) => args[1] === "report-agent").at(-1);
         return report?.[report.indexOf("--state") + 1];
@@ -6585,11 +6587,13 @@ describe("child human wait reporting", () => {
       owner(recoveryDir, f, { startedAt: wait.startedAt + 1 });
       writeFileSync(file, JSON.stringify({ ...wait, startedAt: wait.startedAt + 1 }));
       await new Promise((resolve) => setTimeout(resolve, 1100));
+      await __backgroundAgentStateTest__.drain();
       assert.ok(reportCount() > before, "a new run in the same pane must not inherit the old reporter cache");
       assert.ok(f.calls().every((args) => args[2] !== "w3:p3"), "an expired orphan sidecar must not create fresh lifecycle authority");
       f.emit("ui_prompt_end", { kind: "confirm" });
       copy();
       await new Promise((resolve) => setTimeout(resolve, 1100));
+      await __backgroundAgentStateTest__.drain();
       assert.equal(lastState(), "working", "recovery tick must observe the clear without a watcher or widget");
       const marker = join(f.dir, "fail-report");
       writeFileSync(marker, "fail release");
@@ -6598,6 +6602,7 @@ describe("child human wait reporting", () => {
       await new Promise((resolve) => setTimeout(resolve, 1100));
       rmSync(marker);
       await new Promise((resolve) => setTimeout(resolve, 5100));
+      await __backgroundAgentStateTest__.drain();
       assert.equal(lastState(), "idle", "a completed child must retry a failed release");
       assert.ok(f.calls().some((args) => args[1] === "release-agent"));
       assert.ok(f.calls().every((args) => args[2] !== "w1:p1"), "recovery must not report the main pane");

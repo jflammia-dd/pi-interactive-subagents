@@ -10,7 +10,7 @@
  * Splits always target the parent pi's pane (`$HERDR_PANE_ID`) so they follow
  * the agent rather than the user's focus.
  */
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { connect } from "node:net";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
@@ -474,6 +474,7 @@ export function reportAgentState(
   state: AgentReportState,
   message?: string,
 ): boolean {
+  cancelBackgroundAgentState(surface, name);
   try {
     herdrCli([
       "pane", "report-agent", surface,
@@ -489,6 +490,7 @@ export function reportAgentState(
 
 /** Hand lifecycle authority for this pane back to herdr. */
 export function releaseAgentState(surface: string, name: string): boolean {
+  cancelBackgroundAgentState(surface, name);
   try {
     herdrCli([
       "pane", "release-agent", surface,
@@ -499,6 +501,167 @@ export function releaseAgentState(surface: string, name: string): boolean {
     return true;
   } catch { return false; }
 }
+
+type StateCommand = { state?: AgentReportState; message?: string };
+type StateResult = (acknowledged: boolean) => void;
+interface BackgroundStateTask {
+  signature: string;
+  commands: StateCommand[];
+  listeners: StateResult[];
+  child?: ChildProcess;
+  cancelled?: boolean;
+}
+interface BackgroundStateEntry {
+  surface: string;
+  name: string;
+  acknowledged?: string;
+  active?: BackgroundStateTask;
+  pending?: BackgroundStateTask;
+}
+
+const backgroundStates = new Map<string, BackgroundStateEntry>();
+const backgroundChildren = new Set<ChildProcess>();
+const backgroundDrains = new Set<() => void>();
+const BACKGROUND_STATE_CLEANUP = Symbol.for("pi-subagents/herdr-background-cleanup");
+const backgroundGlobals = globalThis as unknown as Record<symbol, (() => void) | undefined>;
+backgroundGlobals[BACKGROUND_STATE_CLEANUP]?.();
+backgroundGlobals[BACKGROUND_STATE_CLEANUP] = cancelBackgroundAgentStates;
+
+function drainBackgroundStates(): void {
+  if (backgroundChildren.size || [...backgroundStates.values()].some((entry) => entry.active)) return;
+  for (const resolve of backgroundDrains) resolve();
+  backgroundDrains.clear();
+}
+
+function notifyStateResult(task: BackgroundStateTask, acknowledged: boolean): void {
+  for (const listener of task.listeners) {
+    try { listener(acknowledged); } catch { /* Advisory reporting must not break the host. */ }
+  }
+  task.listeners.length = 0;
+}
+
+function startBackgroundState(entry: BackgroundStateEntry, task: BackgroundStateTask): void {
+  entry.active = task;
+  entry.acknowledged = undefined;
+  let index = 0;
+  const run = (): void => {
+    const command = task.commands[index++];
+    const args = [
+      "pane", command.state ? "report-agent" : "release-agent", entry.surface,
+      "--source", AGENT_SOURCE, "--agent", entry.name,
+      ...(command.state ? ["--state", command.state] : []),
+      "--seq", String(nextReportSeq()),
+      ...(command.message ? ["--message", command.message] : []),
+    ];
+    let child: ChildProcess | undefined;
+    const complete = (acknowledged: boolean): void => {
+      if (child) backgroundChildren.delete(child);
+      task.child = undefined;
+      if (task.cancelled) { drainBackgroundStates(); return; }
+      // Idle reporting is best effort. Release still runs if that report fails.
+      if (index < task.commands.length) { run(); return; }
+      entry.active = undefined;
+      entry.acknowledged = acknowledged ? task.signature : undefined;
+      const pending = entry.pending;
+      entry.pending = undefined;
+      if (pending) startBackgroundState(entry, pending);
+      notifyStateResult(task, acknowledged);
+      drainBackgroundStates();
+    };
+    try {
+      child = execFile("herdr", args, {
+        encoding: "utf8", timeout: 2000, killSignal: "SIGKILL",
+      }, (error) => complete(!error));
+      task.child = child;
+      backgroundChildren.add(child);
+      child.stdin?.end();
+    } catch { complete(false); }
+  };
+  run();
+}
+
+/**
+ * Return only acknowledged success. Pending work returns false until its callback
+ * settles, so callers retain their existing retry clocks without blocking the TUI.
+ * Each pane and canonical name has one active command and one latest pending task.
+ * The scope separates successive runs that reuse a pane and name.
+ */
+function queueBackgroundState(
+  surface: string, name: string, scope: string, commands: StateCommand[], onResult?: StateResult,
+): boolean {
+  name = canonicalSubagentName(name);
+  const key = JSON.stringify([surface, name]);
+  const signature = JSON.stringify([scope, commands]);
+  let entry = backgroundStates.get(key);
+  if (!entry) {
+    entry = { surface, name };
+    backgroundStates.set(key, entry);
+  }
+  if (!entry.active && entry.acknowledged === signature) return true;
+  const same = entry.pending?.signature === signature ? entry.pending :
+    entry.active?.signature === signature ? entry.active : undefined;
+  if (same) {
+    if (same === entry.active && entry.pending) {
+      notifyStateResult(entry.pending, false);
+      entry.pending = undefined;
+    }
+    if (onResult) same.listeners.push(onResult);
+    return false;
+  }
+  const task: BackgroundStateTask = { signature, commands, listeners: onResult ? [onResult] : [] };
+  if (entry.active) {
+    if (entry.pending) notifyStateResult(entry.pending, false);
+    entry.pending = task;
+  } else startBackgroundState(entry, task);
+  return false;
+}
+
+export function reportAgentStateInBackground(
+  surface: string, name: string, state: AgentReportState, message?: string,
+  scope = "", onResult?: StateResult,
+): boolean {
+  return queueBackgroundState(surface, name, scope,
+    [{ state, ...(message ? { message: message.slice(0, 120) } : {}) }], onResult);
+}
+
+export function releaseAgentStateInBackground(
+  surface: string, name: string, scope = "", onResult?: StateResult,
+): boolean {
+  return queueBackgroundState(surface, name, scope, [{}], onResult);
+}
+
+/** Preserve idle-then-release ordering as one coalesced recovery operation. */
+export function settleAgentStateInBackground(
+  surface: string, name: string, scope = "", onResult?: StateResult,
+): boolean {
+  return queueBackgroundState(surface, name, scope, [{ state: "idle" }, {}], onResult);
+}
+
+function cancelBackgroundAgentState(surface: string, name: string): void {
+  const key = JSON.stringify([surface, canonicalSubagentName(name)]);
+  const entry = backgroundStates.get(key);
+  if (!entry) return;
+  backgroundStates.delete(key);
+  for (const task of [entry.active, entry.pending]) {
+    if (!task) continue;
+    task.cancelled = true;
+    task.child?.kill("SIGKILL");
+    notifyStateResult(task, false);
+  }
+  entry.active = entry.pending = undefined;
+  drainBackgroundStates();
+}
+
+/** Cancel queued observations before shutdown or a synchronous lifecycle action. */
+export function cancelBackgroundAgentStates(): void {
+  for (const entry of backgroundStates.values()) cancelBackgroundAgentState(entry.surface, entry.name);
+}
+
+export const __backgroundAgentStateTest__ = {
+  drain(): Promise<void> {
+    return new Promise((resolve) => { backgroundDrains.add(resolve); drainBackgroundStates(); });
+  },
+};
 
 /**
  * Drop the cached subagent-tab id, so the next `tab` placement rediscovers it

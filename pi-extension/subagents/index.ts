@@ -31,6 +31,10 @@ import {
   readScreen,
   reportAgentState,
   releaseAgentState,
+  reportAgentStateInBackground,
+  releaseAgentStateInBackground,
+  settleAgentStateInBackground,
+  cancelBackgroundAgentStates,
   canonicalSubagentName,
   type SurfacePlacement,
   type AgentReportState,
@@ -1042,6 +1046,7 @@ interface RunningSubagent {
   herdrRetryState?: AgentReportState;
   herdrNextRetryAt?: number;
   herdrObservedAt?: number;
+  herdrReportVersion?: number;
   /** Path to the git worktree this subagent runs in, if worktree isolation is on. */
   worktreePath?: string;
   /** JSON Schema for structured output validation, if the agent declares one. */
@@ -1425,7 +1430,7 @@ const HERDR_STATE_BY_KIND: Record<SubagentStatusKind, AgentReportState | null> =
  */
 const HUMAN_WAIT_RETRY_MS = 5_000;
 
-function syncHerdrAgentState(running: RunningSubagent, observedAt: number, deferExpiry = false): void {
+function syncHerdrAgentState(running: RunningSubagent, observedAt: number, deferExpiry = false, background = false): void {
   const snapshot = classifyStatus(running.statusState, observedAt);
   const wait = process.env.HERDR_ENV === "1" && running.activityFile &&
     running.activity?.phase !== "done" && !existsSync(`${running.sessionFile}.exit`)
@@ -1436,9 +1441,16 @@ function syncHerdrAgentState(running: RunningSubagent, observedAt: number, defer
   if (!state || state === running.herdrState) return;
   if (running.herdrRetryState === state && observedAt < (running.herdrNextRetryAt ?? 0)) return;
   running.herdrRetryState = state;
-  running.herdrState = reportAgentState(running.surface, running.name, state, snapshot.activityLabel ?? undefined)
-    ? state : undefined;
-  running.herdrNextRetryAt = running.herdrState ? 0 : observedAt + HUMAN_WAIT_RETRY_MS;
+  const version = running.herdrReportVersion = (running.herdrReportVersion ?? 0) + 1;
+  const acknowledge = (reported: boolean): void => {
+    if (running.herdrReportVersion !== version) return;
+    running.herdrState = reported ? state : undefined;
+    running.herdrNextRetryAt = reported ? 0 : observedAt + HUMAN_WAIT_RETRY_MS;
+  };
+  acknowledge(background
+    ? reportAgentStateInBackground(running.surface, running.name, state, snapshot.activityLabel ?? undefined,
+      `${running.id}:${running.startTime}`, acknowledge)
+    : reportAgentState(running.surface, running.name, state, snapshot.activityLabel ?? undefined));
 }
 
 /**
@@ -1456,18 +1468,29 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
     state: AgentReportState; reported: boolean; nextRetryAt: number;
   }>();
   const staleReleases = new Map<string, { identity: string; released: boolean; nextRetryAt: number }>();
+  let stopped = false;
   let lastTick = Date.now();
   function release(file: string, now = Date.now(), force = false): boolean {
     const prior = recovered.get(file);
     if (!prior) return true;
     if (!force && now < prior.nextRetryAt) return false;
-    reportAgentState(prior.surface, prior.name, "idle");
-    if (!releaseAgentState(prior.surface, prior.name)) {
-      prior.nextRetryAt = now + HUMAN_WAIT_RETRY_MS;
-      return false;
+    const acknowledge = (released: boolean): void => {
+      if (recovered.get(file) !== prior) return;
+      if (released) {
+        recovered.delete(file);
+        if (!force && !stopped) refresh();
+      } else prior.nextRetryAt = now + HUMAN_WAIT_RETRY_MS;
+    };
+    let released: boolean;
+    if (force) {
+      reportAgentState(prior.surface, prior.name, "idle");
+      released = releaseAgentState(prior.surface, prior.name);
+    } else {
+      released = settleAgentStateInBackground(prior.surface, prior.name,
+        `${prior.startedAt}:${prior.pid}`, acknowledge);
     }
-    recovered.delete(file);
-    return true;
+    acknowledge(released);
+    return released;
   }
   function cleanSiblingWaits(now: number, deferExpiry: boolean): void {
     const root = dirname(dirname(dir));
@@ -1495,16 +1518,20 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
         const prior = staleReleases.get(activityFile);
         if (prior?.identity === identity && (prior.released || now < prior.nextRetryAt)) continue;
         // Release only our recorded source. Never report idle over a new session's work.
-        const released = releaseAgentState(owner.pane, owner.name);
-        staleReleases.set(activityFile, { identity, released, nextRetryAt: now + HUMAN_WAIT_RETRY_MS });
+        const record = { identity, released: false, nextRetryAt: now + HUMAN_WAIT_RETRY_MS };
+        staleReleases.set(activityFile, record);
+        record.released = releaseAgentStateInBackground(owner.pane, owner.name, identity, (released) => {
+          if (staleReleases.get(activityFile) === record) record.released = released;
+        });
       }
     }
   }
   function refresh(): void {
+    if (stopped) return;
     const now = Date.now();
     const deferExpiry = now - lastTick > HUMAN_WAIT_LEASE_MS;
     lastTick = now;
-    for (const running of runningSubagents.values()) observeRunningSubagent(running, now, deferExpiry);
+    for (const running of runningSubagents.values()) observeRunningSubagent(running, now, deferExpiry, true);
     cleanSiblingWaits(now, deferExpiry);
     const seen = new Set<string>();
     let files: string[] = [];
@@ -1532,12 +1559,19 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
           ? "working" : "idle";
       const cached = recovered.get(file);
       if (cached?.state !== state || (!cached.reported && now >= cached.nextRetryAt)) {
-        const reported = reportAgentState(owner.pane, owner.name, state);
-        recovered.set(file, {
+        const record = {
           surface: owner.pane, name: owner.name, pid: wait.pid,
-          startedAt: wait.startedAt, state, reported,
-          nextRetryAt: reported ? 0 : now + HUMAN_WAIT_RETRY_MS,
-        });
+          startedAt: wait.startedAt, state, reported: false,
+          nextRetryAt: now + HUMAN_WAIT_RETRY_MS,
+        };
+        recovered.set(file, record);
+        record.reported = reportAgentStateInBackground(owner.pane, owner.name, state, undefined,
+          `${owner.startedAt}:${wait.pid}`, (reported) => {
+            if (recovered.get(file) !== record) return;
+            record.reported = reported;
+            record.nextRetryAt = reported ? 0 : now + HUMAN_WAIT_RETRY_MS;
+          });
+        if (record.reported) record.nextRetryAt = 0;
       }
     }
     for (const file of recovered.keys()) if (!seen.has(file)) release(file);
@@ -1546,6 +1580,7 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
   const timer = setInterval(refresh, 1000);
   timer.unref?.();
   return () => {
+    stopped = true;
     clearInterval(timer);
     for (const file of recovered.keys()) release(file, Date.now(), true);
   };
@@ -1554,6 +1589,7 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
 /** Settle the pane at idle and hand lifecycle authority back to herdr. */
 function finishHerdrAgentState(running: RunningSubagent, message?: string): void {
   if (running.cli === "claude") return;
+  running.herdrReportVersion = (running.herdrReportVersion ?? 0) + 1;
   if (running.herdrState && running.herdrState !== "idle") {
     reportAgentState(running.surface, running.name, "idle", message);
   }
@@ -1561,7 +1597,7 @@ function finishHerdrAgentState(running: RunningSubagent, message?: string): void
   releaseAgentState(running.surface, running.name);
 }
 
-function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(), deferExpiry = false) {
+function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(), deferExpiry = false, background = false) {
   if (running.cli === "claude") return;
   deferExpiry ||= running.herdrObservedAt !== undefined && observedAt - running.herdrObservedAt > HUMAN_WAIT_LEASE_MS;
   running.herdrObservedAt = observedAt;
@@ -1590,7 +1626,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       activityLabel: activityLabel(read.activity),
       toolStartedAt: read.activity.toolStartedAt,
     }, observedAt);
-    syncHerdrAgentState(running, observedAt, deferExpiry);
+    syncHerdrAgentState(running, observedAt, deferExpiry, background);
     return;
   }
 
@@ -1598,7 +1634,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     snapshot: read.reason,
     snapshotError: read.error,
   }, observedAt);
-  syncHerdrAgentState(running, observedAt, deferExpiry);
+  syncHerdrAgentState(running, observedAt, deferExpiry, background);
 }
 
 /**
@@ -1761,7 +1797,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
-      observeRunningSubagent(running, now);
+      observeRunningSubagent(running, now, false, true);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
         shouldRefreshWidget = true;
@@ -2002,6 +2038,7 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
+  startStatusRefresh,
   startHumanWaitRefresh,
   finishHerdrAgentState,
   getToolExtensionSpecifiers,
@@ -2764,7 +2801,7 @@ async function watchSubagent(
         // Status and human-wait recovery ticks also observe these small files.
         // The independent recovery tick survives watcher timeouts and disabled
         // widgets. State reporting sends only transitions or failed-report retries.
-        observeRunningSubagent(running);
+        observeRunningSubagent(running, Date.now(), false, true);
         deliverPendingQuestion(running);
       },
     });
@@ -2976,6 +3013,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, _ctx) => {
     stopHumanWaitRefresh?.();
     stopHumanWaitRefresh = undefined;
+    cancelBackgroundAgentStates();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
