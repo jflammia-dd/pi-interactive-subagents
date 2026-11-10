@@ -6037,6 +6037,32 @@ describe("child human wait reporting", () => {
     });
   }
 
+  it("resume points a removed working directory at the pane's directory before relaunching", async () => {
+    await withLaunchFixture(async ({ f, ctx, projectDir, scripts, shutdown }) => {
+      const removed = join(f.dir, "removed-worktree");
+      const session = join(f.dir, "resume-gone.jsonl");
+      const body = JSON.stringify({ type: "message", id: "m1", parentId: null }) + "\n";
+      writeFileSync(session, JSON.stringify({ type: "session", id: "resume-gone", cwd: removed }) + "\n" + body);
+      writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+      registerName(join(f.dir, "artifacts", "parent"), "gone-resume", { sessionFile: session, sessionId: "resume-gone" });
+      writeSubagentLoadout(session, { agent: "scout", toolAllowlist: "read,grep,find", model: null,
+        thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+        autoExit: true, cwd: removed, agentDir: process.env.PI_CODING_AGENT_DIR ?? null,
+        searchRoots: [fs.realpathSync(projectDir)] } as any);
+      const { api, registeredTools } = createMockExtensionApi();
+      api.on = (name: string, fn: Function) => { if (name === "session_shutdown") shutdown.push(fn); };
+      (subagentsModule as any).default(api);
+      const result = await registeredTools.find((t) => t.name === "subagent_message")!.execute(
+        "resume-call", { name: "gone-resume", message: "continue" }, undefined, undefined, ctx);
+      assert.equal(result.details?.status, "started");
+      await new Promise<void>((done) => setImmediate(done));
+      const lines = readFileSync(session, "utf8").split("\n");
+      assert.equal(JSON.parse(lines[0]).cwd, ctx.cwd, "the header names a directory that exists");
+      assert.equal(lines.slice(1).join("\n"), body, "every other line is untouched");
+      assert.ok(readdirSync(scripts).some((n) => readFileSync(join(scripts, n), "utf8").includes("gone-resume")), "the child was launched");
+    });
+  });
+
   it("RED/GREEN: subagent_parallel passes each task's searchRoots through", async () => {
     await withLaunchFixture(async ({ ctx, projectDir, scripts, shutdown }) => {
       const { api, registeredTools } = createMockExtensionApi();

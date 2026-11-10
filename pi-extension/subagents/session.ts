@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
@@ -8,7 +9,9 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -401,6 +404,72 @@ function readHeaderId(sessionFile: string): string | null {
     return entry.type === "session" && typeof entry.id === "string" ? entry.id : null;
   } catch {
     return null;
+  }
+}
+
+export interface RepointResult {
+  changed: boolean;
+  from?: string;
+  to?: string;
+}
+
+/**
+ * Point a session header's `cwd` at a directory that exists.
+ *
+ * A worktree subagent's checkout is removed when it finishes, so its session header still names a
+ * directory that is gone. Pi's interactive startup then stops at a "Session cwd does not exist"
+ * selector (Continue, Fork or Cancel) that nobody answers in a child pane. Only the first line is
+ * rewritten, and only its `cwd` field changes. Every later line stays byte for byte, the file mode
+ * is kept (the umask does not strip it), a symlink is followed so the link survives, and the swap
+ * is a rename so a reader never sees a half-written file. If another process appends while the
+ * copy is made, the swap is skipped so that line is not lost. Nothing changes when the header is
+ * missing, malformed, not a session header, already points at an existing directory, or when the
+ * fallback does not exist either. A resume that finds a valid header reads only its first line.
+ */
+export function repointMissingSessionCwd(
+  sessionFile: string,
+  fallbackCwd: string,
+  hooks: { beforeRename?: () => void } = {},
+): RepointResult {
+  let tmp: string | undefined;
+  try {
+    if (!existsSync(fallbackCwd)) return { changed: false };
+    const real = realpathSync(sessionFile);
+    const firstLine = readFirstLine(real);
+    if (!firstLine) return { changed: false };
+    const header = JSON.parse(firstLine) as { type?: unknown; cwd?: unknown };
+    if (header.type !== "session" || typeof header.cwd !== "string" || header.cwd.length === 0) {
+      return { changed: false };
+    }
+    if (existsSync(header.cwd)) return { changed: false };
+    const before = statSync(real);
+    const data = readFileSync(real);
+    const newline = data.indexOf(0x0a);
+    const from = header.cwd;
+    header.cwd = fallbackCwd;
+    const rest = newline === -1 ? Buffer.alloc(0) : data.subarray(newline);
+    const updated = Buffer.concat([Buffer.from(JSON.stringify(header), "utf8"), rest]);
+    const mode = before.mode & 0o777;
+    tmp = `${real}.${randomBytes(4).toString("hex")}.tmp`;
+    writeFileSync(tmp, updated, { mode });
+    chmodSync(tmp, mode);
+    hooks.beforeRename?.();
+    const now = statSync(real);
+    if (now.size !== before.size || now.mtimeMs !== before.mtimeMs) {
+      rmSync(tmp, { force: true });
+      return { changed: false };
+    }
+    renameSync(tmp, real);
+    return { changed: true, from, to: fallbackCwd };
+  } catch {
+    if (tmp) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+    return { changed: false };
   }
 }
 

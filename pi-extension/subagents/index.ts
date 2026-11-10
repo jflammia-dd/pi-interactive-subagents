@@ -44,6 +44,7 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  repointMissingSessionCwd,
   resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSessionStats,
@@ -3499,6 +3500,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // removed on completion (its work lives on the branch). Fall back to
         // the parent's cwd rather than failing the split on a dead path.
         const resumeCwd = loadout.cwd && existsSync(loadout.cwd) ? loadout.cwd : undefined;
+        // The session header can name that removed checkout too. Pi would stop at a
+        // Continue/Fork/Cancel selector that no one answers in a child pane, so point the
+        // header at the directory the pane starts in before relaunching.
+        repointMissingSessionCwd(sessionPath, resumeCwd ?? ctx.cwd);
         const surface = createSurface(name, resumedPlacement, resumeCwd);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
