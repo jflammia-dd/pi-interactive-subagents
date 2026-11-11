@@ -1429,6 +1429,8 @@ const HERDR_STATE_BY_KIND: Record<SubagentStatusKind, AgentReportState | null> =
  * Reports transitions only — a spawn per tick would be wasteful and pointless.
  */
 const HUMAN_WAIT_RETRY_MS = 5_000;
+const SIBLING_SCAN_INTERVAL_MS = 60_000;
+const STALE_WAIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function syncHerdrAgentState(running: RunningSubagent, observedAt: number, deferExpiry = false, background = false): void {
   const snapshot = classifyStatus(running.statusState, observedAt);
@@ -1467,17 +1469,66 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
     surface: string; name: string; pid: number; startedAt: number;
     state: AgentReportState; reported: boolean; nextRetryAt: number;
   }>();
-  const staleReleases = new Map<string, { identity: string; released: boolean; nextRetryAt: number }>();
+  const staleReleases = new Map<string, { id: string; identity: string; released: boolean; nextRetryAt: number }>();
   let stopped = false;
   let lastTick = Date.now();
+  let nextSiblingScanAt = lastTick;
+  function readStaleWait(activityFile: string, id: string, now: number, deferExpiry: boolean) {
+    try {
+      if (runningSubagents.has(id) || !lstatSync(dirname(activityFile)).isDirectory() ||
+          !lstatSync(dirname(dirname(activityFile))).isDirectory()) return;
+      const owner = readHumanWaitOwner(activityFile, id);
+      if (!owner || owner.pane === process.env.HERDR_PANE_ID) return;
+      const wait = readHumanWait(activityFile, id, owner.startedAt, now, { allowDead: true, deferExpiry });
+      if (!wait || owner.pane !== wait.pane || owner.name !== wait.name ||
+          (wait.alive && !wait.expired && wait.count > 0)) return;
+      const stat = lstatSync(`${activityFile}.wait`);
+      if (!stat.isFile()) return;
+      // File metadata keeps lease expiry from changing an unchanged writer's identity.
+      const identity = JSON.stringify([owner.startedAt, owner.pane, owner.name, wait.pid, wait.updatedAt,
+        stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+      return { id, identity, owner, wait, modifiedAt: stat.mtimeMs };
+    } catch { return; }
+  }
+  function pruneStaleWait(activityFile: string, snapshot: NonNullable<ReturnType<typeof readStaleWait>>): void {
+    const now = Date.now();
+    const current = readStaleWait(activityFile, snapshot.id, now, false);
+    if (!current || current.identity !== snapshot.identity || current.wait.alive ||
+        now - current.modifiedAt <= STALE_WAIT_MAX_AGE_MS) return;
+    try { unlinkSync(`${activityFile}.wait`); } catch {}
+  }
+  function reconcileStaleWait(activityFile: string, id: string, now: number, deferExpiry: boolean): void {
+    const snapshot = readStaleWait(activityFile, id, now, deferExpiry);
+    if (!snapshot) { staleReleases.delete(activityFile); return; }
+    const { identity, owner } = snapshot;
+    const prior = staleReleases.get(activityFile);
+    if (prior?.identity === identity) {
+      if (prior.released) { pruneStaleWait(activityFile, snapshot); return; }
+      if (now < prior.nextRetryAt) return;
+    }
+    // Release only our recorded source. Never report idle over a new session's work.
+    const record = { id, identity, released: false, nextRetryAt: now + HUMAN_WAIT_RETRY_MS };
+    staleReleases.set(activityFile, record);
+    const acknowledge = (released: boolean): void => {
+      if (stopped || staleReleases.get(activityFile) !== record) return;
+      record.released = released;
+      if (released) pruneStaleWait(activityFile, snapshot);
+    };
+    acknowledge(releaseAgentStateInBackground(owner.pane, owner.name, identity, acknowledge));
+  }
   function release(file: string, now = Date.now(), force = false): boolean {
     const prior = recovered.get(file);
     if (!prior) return true;
     if (!force && now < prior.nextRetryAt) return false;
+    const activityFile = join(dir, file.slice(0, -5));
+    const snapshot = readStaleWait(activityFile, file.slice(0, -10), now, false);
+    const mayPrune = snapshot && snapshot.wait.pid === prior.pid && snapshot.owner.startedAt === prior.startedAt &&
+      snapshot.owner.pane === prior.surface && snapshot.owner.name === prior.name;
     const acknowledge = (released: boolean): void => {
       if (recovered.get(file) !== prior) return;
       if (released) {
         recovered.delete(file);
+        if (mayPrune) pruneStaleWait(activityFile, snapshot);
         if (!force && !stopped) refresh();
       } else prior.nextRetryAt = now + HUMAN_WAIT_RETRY_MS;
     };
@@ -1495,7 +1546,8 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
   function cleanSiblingWaits(now: number, deferExpiry: boolean): void {
     const root = dirname(dirname(dir));
     let sessions: string[] = [];
-    try { sessions = readdirSync(root); } catch {}
+    try { sessions = readdirSync(root); } catch { return; }
+    const seen = new Set<string>();
     for (const session of sessions) {
       const sibling = join(root, session, "subagent-activity");
       if (sibling === dir) continue;
@@ -1507,32 +1559,28 @@ function startHumanWaitRefresh(ctx: ExtensionContext): (() => void) | undefined 
       for (const file of files) {
         if (!/^[a-z0-9_-]{1,64}\.json\.wait$/i.test(file)) continue;
         const id = file.slice(0, -10);
-        if (runningSubagents.has(id)) continue;
         const activityFile = join(sibling, `${id}.json`);
-        const owner = readHumanWaitOwner(activityFile, id);
-        if (!owner || owner.pane === process.env.HERDR_PANE_ID) continue;
-        const wait = readHumanWait(activityFile, id, owner.startedAt, now, { allowDead: true, deferExpiry });
-        if (!wait || owner.pane !== wait.pane || owner.name !== wait.name ||
-            (wait.alive && !wait.expired && wait.count > 0)) continue;
-        const identity = `${owner.startedAt}:${wait.pid}:${wait.updatedAt}:${wait.count}`;
-        const prior = staleReleases.get(activityFile);
-        if (prior?.identity === identity && (prior.released || now < prior.nextRetryAt)) continue;
-        // Release only our recorded source. Never report idle over a new session's work.
-        const record = { identity, released: false, nextRetryAt: now + HUMAN_WAIT_RETRY_MS };
-        staleReleases.set(activityFile, record);
-        record.released = releaseAgentStateInBackground(owner.pane, owner.name, identity, (released) => {
-          if (staleReleases.get(activityFile) === record) record.released = released;
-        });
+        seen.add(activityFile);
+        reconcileStaleWait(activityFile, id, now, deferExpiry);
       }
     }
+    for (const file of staleReleases.keys()) if (!seen.has(file)) staleReleases.delete(file);
   }
   function refresh(): void {
     if (stopped) return;
     const now = Date.now();
     const deferExpiry = now - lastTick > HUMAN_WAIT_LEASE_MS;
+    if (now < lastTick) nextSiblingScanAt = now;
     lastTick = now;
     for (const running of runningSubagents.values()) observeRunningSubagent(running, now, deferExpiry, true);
-    cleanSiblingWaits(now, deferExpiry);
+    if (now >= nextSiblingScanAt) {
+      nextSiblingScanAt = now + SIBLING_SCAN_INTERVAL_MS;
+      cleanSiblingWaits(now, deferExpiry);
+    }
+    // Known failures keep their retry clock without another directory walk.
+    for (const [file, record] of staleReleases) {
+      if (!record.released && now >= record.nextRetryAt) reconcileStaleWait(file, record.id, now, deferExpiry);
+    }
     const seen = new Set<string>();
     let files: string[] = [];
     try { files = readdirSync(dir); } catch {}
@@ -2040,6 +2088,8 @@ export const __test__ = {
   observeRunningSubagent,
   startStatusRefresh,
   startHumanWaitRefresh,
+  SIBLING_SCAN_INTERVAL_MS,
+  STALE_WAIT_MAX_AGE_MS,
   finishHerdrAgentState,
   getToolExtensionSpecifiers,
   resolveRunningByName,

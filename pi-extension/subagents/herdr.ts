@@ -10,34 +10,78 @@
  * Splits always target the parent pi's pane (`$HERDR_PANE_ID`) so they follow
  * the agent rather than the user's focus.
  */
-import { execFile, execFileSync, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, type ChildProcess, type ExecFileException, type ExecFileOptionsWithStringEncoding } from "node:child_process";
 import { connect } from "node:net";
-import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
-const execFileAsync = promisify(execFile);
+// Cache resolution rather than repeating the PATH search for each sidebar update.
+let herdrExecutable: { key: string; executable: string } | undefined;
 
-// ── Availability ──
-
-const commandAvailability = new Map<string, boolean>();
-
-function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
+function resolveHerdrExecutable(refresh = false): string {
+  const override = process.env.PI_SUBAGENTS_HERDR_BIN;
+  const searchPath = process.env.PATH ?? "";
+  const key = JSON.stringify([override, searchPath, process.cwd()]);
+  if (!refresh && herdrExecutable?.key === key) return herdrExecutable.executable;
+  const candidates = override ? [resolve(override)]
+    : searchPath.split(delimiter).map((entry) => resolve(entry || ".", "herdr"));
+  let executable = "herdr";
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (!statSync(candidate).isFile()) continue;
+      executable = candidate;
+      break;
+    } catch {}
   }
+  herdrExecutable = { key, executable };
+  return executable;
+}
 
-  let available = false;
-  try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
-    available = true;
-  } catch {
-    available = false;
+function missingExecutableRetry(error: unknown, executable: string, refreshed: boolean): string | undefined {
+  if ((error as NodeJS.ErrnoException)?.code !== "ENOENT" || executable === "herdr") return;
+  return refreshed ? "herdr" : resolveHerdrExecutable(true);
+}
+
+function execHerdr(
+  args: string[], options: ExecFileOptionsWithStringEncoding,
+  complete: (error: ExecFileException | null, stdout: string, stderr: string) => void,
+  onChild?: (child: ChildProcess) => void,
+  mayRetry: () => boolean = () => true,
+): void {
+  let executable = resolveHerdrExecutable();
+  let refreshed = false;
+  const launch = (): void => {
+    const child = execFile(executable, args, options, (error, stdout, stderr) => {
+      const retry = missingExecutableRetry(error, executable, refreshed);
+      if (retry && mayRetry()) {
+        executable = retry;
+        refreshed = true;
+        launch();
+      } else complete(error, stdout, stderr);
+    });
+    onChild?.(child);
+  };
+  launch();
+}
+
+function herdrCliAsync(args: string[], options: ExecFileOptionsWithStringEncoding): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execHerdr(args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+  });
+}
+
+function isMissingPaneRelease(error: unknown, stdout?: unknown, stderr?: unknown): boolean {
+  const failure = error as { stdout?: unknown; stderr?: unknown } | null;
+  for (const output of [stdout, stderr, failure?.stdout, failure?.stderr]) {
+    if (typeof output !== "string" && !Buffer.isBuffer(output)) continue;
+    if (output.length > 1024 * 1024) continue;
+    try {
+      if (JSON.parse(output.toString()).error?.code === "pane_not_found") return true;
+    } catch {}
   }
-
-  commandAvailability.set(command, available);
-  return available;
+  return false;
 }
 
 /**
@@ -45,7 +89,7 @@ function hasCommand(command: string): boolean {
  * `HERDR_ENV=1` is set by herdr in every process it spawns.
  */
 export function isHerdrAvailable(): boolean {
-  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+  return process.env.HERDR_ENV === "1" && resolveHerdrExecutable() !== "herdr";
 }
 
 export function isMuxAvailable(): boolean {
@@ -69,7 +113,18 @@ function requireHerdr(): void {
  * there on any failure, and letting that reach the terminal corrupts pi's TUI.
  */
 function herdrCli(args: string[], timeout?: number): string {
-  return execFileSync("herdr", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout });
+  let executable = resolveHerdrExecutable();
+  let refreshed = false;
+  for (;;) {
+    try {
+      return execFileSync(executable, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout });
+    } catch (error) {
+      const retry = missingExecutableRetry(error, executable, refreshed);
+      if (!retry) throw error;
+      executable = retry;
+      refreshed = true;
+    }
+  }
 }
 
 // ── Shell helpers ──
@@ -499,7 +554,7 @@ export function releaseAgentState(surface: string, name: string): boolean {
       "--seq", String(nextReportSeq()),
     ], 2000);
     return true;
-  } catch { return false; }
+  } catch (error) { return isMissingPaneRelease(error); }
 }
 
 type StateCommand = { state?: AgentReportState; message?: string };
@@ -569,12 +624,16 @@ function startBackgroundState(entry: BackgroundStateEntry, task: BackgroundState
       drainBackgroundStates();
     };
     try {
-      child = execFile("herdr", args, {
+      execHerdr(args, {
         encoding: "utf8", timeout: 2000, killSignal: "SIGKILL",
-      }, (error) => complete(!error));
-      task.child = child;
-      backgroundChildren.add(child);
-      child.stdin?.end();
+      }, (error, stdout, stderr) => complete(!error || (!command.state && isMissingPaneRelease(error, stdout, stderr))),
+      (next) => {
+        if (child) backgroundChildren.delete(child);
+        child = next;
+        task.child = next;
+        backgroundChildren.add(next);
+        next.stdin?.end();
+      }, () => !task.cancelled);
     } catch { complete(false); }
   };
   run();
@@ -1023,12 +1082,12 @@ export function readScreen(surface: string, lines = 50): string {
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireHerdr();
   try {
-    const { stdout } = await execFileAsync("herdr", readArgs(surface, lines, "recent-unwrapped"), {
+    const { stdout } = await herdrCliAsync(readArgs(surface, lines, "recent-unwrapped"), {
       encoding: "utf8",
     });
     if (stdout.trim() !== "") return stdout;
   } catch {}
-  const fallback = await execFileAsync("herdr", readArgs(surface, lines, "visible"), {
+  const fallback = await herdrCliAsync(readArgs(surface, lines, "visible"), {
     encoding: "utf8",
   });
   return fallback.stdout;
@@ -1147,8 +1206,8 @@ function watchForSentinel(
   if (signal.aborted) return;
 
   const pattern = sentinelPattern(id);
-  const child = execFile(
-    "herdr",
+  let child: ChildProcess | undefined;
+  execHerdr(
     [
       "pane", "wait-output", surface,
       "--regex", pattern,
@@ -1183,10 +1242,12 @@ function watchForSentinel(
       }
       signal.addEventListener("abort", cancelRetry, { once: true });
     },
+    (next) => { child = next; },
+    () => !signal.aborted,
   );
 
   function kill() {
-    child.kill();
+    child?.kill();
   }
   signal.addEventListener("abort", kill, { once: true });
 }

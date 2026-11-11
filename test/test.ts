@@ -4869,12 +4869,12 @@ describe("completion delivery after a watch timeout", () => {
       commands.push([command, ...args]);
       if (command === "sh") return "";
       if (command === "git") throw new Error("No git operation expected in this fixture");
-      assert.equal(command, "herdr");
+      assert.equal(command.split("/").pop(), "herdr");
       if (args[1] === "split") return JSON.stringify({ result: { pane: { pane_id: "w99:p99" } } });
       return "{}";
     });
     t.mock.method(childProcess, "execFile", (command: string, args: string[], _options: any, callback: any) => {
-      assert.equal(command, "herdr");
+      assert.equal(command.split("/").pop(), "herdr");
       assert.equal(args[1], "wait-output");
       watches++;
       let stopped = false;
@@ -6157,18 +6157,18 @@ describe("child human wait reporting", () => {
       r = await recovery(f, "fresh");
       assert.equal(f.calls().length, 0, "fresh session must not take authority over a live sibling wait");
       writeFileSync(file, JSON.stringify({ ...wait, count: 0 }));
-      await r.tick();
+      for (let ms = 0; ms < testApi.SIBLING_SCAN_INTERVAL_MS; ms += 1000) await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "fresh session must release a trusted closed wait");
       assert.ok(f.calls().every((a) => a[2] === "w9S:pE"));
-      await r.tick();
+      for (let ms = 0; ms < testApi.SIBLING_SCAN_INTERVAL_MS; ms += 1000) await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 1, "cleared sibling must not be released repeatedly");
       for (const [id, patch] of [["expired", { updatedAt: Date.now() - 9000 }], ["dead", { pid: 2147483647 }]] as const) {
         owner(dir, f, { runningChildId: id, startedAt: Date.now() - 20000 });
         writeFileSync(join(dir, `${id}.json.wait`), JSON.stringify({ ...wait, runningChildId: id,
-          startedAt: Date.now() - 20000, ...patch }));
+          startedAt: Date.now() - 20000, updatedAt: Date.now(), ...patch }));
       }
       writeFileSync(join(dir, "forged.json.wait"), JSON.stringify({ ...wait, runningChildId: "forged", count: 0, pane: "w90:pX" }));
-      await r.tick();
+      for (let ms = 0; ms < testApi.SIBLING_SCAN_INTERVAL_MS; ms += 1000) await r.tick();
       assert.equal(f.calls().filter((a) => a[1] === "release-agent").length, 3, "trusted expired and dead waits must clear");
       assert.ok(f.calls().every((a) => a[2] !== "w90:pX"), "unowned sibling must not be released");
     } finally { r?.close(); f.close(); }
