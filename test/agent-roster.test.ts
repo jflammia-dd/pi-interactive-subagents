@@ -268,6 +268,148 @@ describe("available-agents roster section", () => {
   });
 });
 
+// --- Forced system prompt (runner-faithful mock) ---
+
+/**
+ * Faithful mock of the Pi 1.5.2 before_agent_start runner semantics:
+ * - event.systemPrompt is a live getter rendered from systemPromptOptions
+ * - a handler returning { systemPrompt } sets options.forceSystemPrompt
+ * - once forceSystemPrompt is set the provider payload is exactly the forced
+ *   content: section writes from later handlers never reach the provider
+ */
+function makeRunnerEvent(): any {
+  const options: {
+    cwd: string;
+    sections: Record<string, string>;
+    forceSystemPrompt?: string;
+  } = { cwd: process.cwd(), sections: {} };
+  const render = () => {
+    const rendered = Object.entries(options.sections)
+      .map(([name, text]) => `<${name}>\n${text}\n</${name}>`)
+      .join("\n\n");
+    return rendered ? `BASE PROMPT\n\n${rendered}` : "BASE PROMPT";
+  };
+  return {
+    type: "before_agent_start",
+    messageType: "user",
+    prompt: "do the work",
+    systemPromptOptions: options,
+    get systemPrompt() {
+      return options.forceSystemPrompt !== undefined
+        ? options.forceSystemPrompt
+        : render();
+    },
+  };
+}
+
+/** Run one handler the way the runner does: apply a returned systemPrompt. */
+async function runLikeRunner(handler: (event: any) => any, event: any) {
+  const result = await handler(event);
+  if (result && typeof result.systemPrompt === "string") {
+    event.systemPromptOptions.forceSystemPrompt = result.systemPrompt;
+  }
+  return result;
+}
+
+/** Simulate an earlier extension forcing the whole prompt (e.g. herdr-context). */
+async function applyEarlierForcer(event: any) {
+  return runLikeRunner(
+    (ev: any) => ({
+      systemPrompt: ev.systemPrompt + "\n\n<earlier-forcer>\nforced\n</earlier-forcer>",
+    }),
+    event,
+  );
+}
+
+async function runRosterHandler(event: any) {
+  const { handlers, api } = createCapturingMockApi();
+  subagentsModule.default(api);
+  const handler = handlers["before_agent_start"];
+  assert.ok(handler, "before_agent_start handler must be registered");
+  return runLikeRunner(handler, event);
+}
+
+describe("available-agents roster under a forced system prompt", () => {
+  it("no earlier forcer: sets the section and returns nothing", async () => {
+    await withAgentEnv(async () => {
+      const event = makeRunnerEvent();
+      const result = await runRosterHandler(event);
+      assert.equal(result, undefined);
+      const section = event.systemPromptOptions.sections["available-agents"];
+      assert.ok(section, "section must be set when nothing forced the prompt");
+      assert.ok(event.systemPrompt.includes(section));
+    });
+  });
+
+  it("earlier forcer: appends the roster to the forced prompt and returns it, writing no section", async () => {
+    await withAgentEnv(async () => {
+      // Render the roster once unforced to capture the section text.
+      const plain = makeRunnerEvent();
+      await runRosterHandler(plain);
+      const rosterText = plain.systemPromptOptions.sections["available-agents"];
+      assert.ok(rosterText);
+
+      const event = makeRunnerEvent();
+      await applyEarlierForcer(event);
+      const forcedBefore = event.systemPrompt;
+      const result = await runRosterHandler(event);
+      // Returns a replacement prompt, never a section write.
+      assert.deepEqual(result, {
+        systemPrompt:
+          forcedBefore + "\n\n<available-agents>\n" + rosterText + "\n</available-agents>",
+      });
+      assert.equal(
+        event.systemPromptOptions.sections["available-agents"],
+        undefined,
+        "must not write a section when the prompt is already forced",
+      );
+      // The roster text survives in the provider payload.
+      assert.ok(event.systemPrompt.startsWith(forcedBefore));
+      assert.ok(event.systemPrompt.includes("- scout:"));
+    });
+  });
+
+  it("byte-identical output across two turns in both modes", async () => {
+    await withAgentEnv(async () => {
+      // Unforced mode: the section text is byte-identical.
+      const e1 = makeRunnerEvent();
+      const e2 = makeRunnerEvent();
+      await runRosterHandler(e1);
+      await runRosterHandler(e2);
+      assert.equal(
+        e1.systemPromptOptions.sections["available-agents"],
+        e2.systemPromptOptions.sections["available-agents"],
+      );
+      // Forced mode: the returned prompt is byte-identical.
+      const f1 = makeRunnerEvent();
+      const f2 = makeRunnerEvent();
+      await applyEarlierForcer(f1);
+      await applyEarlierForcer(f2);
+      const r1 = await runRosterHandler(f1);
+      const r2 = await runRosterHandler(f2);
+      assert.ok(r1?.systemPrompt && r2?.systemPrompt);
+      assert.equal(r1.systemPrompt, r2.systemPrompt);
+    });
+  });
+
+  it("missing systemPromptOptions skips without throwing", async () => {
+    await withAgentEnv(async () => {
+      const { handlers, api } = createCapturingMockApi();
+      subagentsModule.default(api);
+      const handler = handlers["before_agent_start"];
+      assert.ok(handler);
+      const event = {
+        type: "before_agent_start",
+        messageType: "user",
+        prompt: "do the work",
+        systemPrompt: "current prompt",
+      };
+      const result = await handler(event);
+      assert.equal(result, undefined);
+    });
+  });
+});
+
 describe("getFrontmatterValue quote handling", () => {
   const parse = (frontmatter: string) =>
     (subagentsModule as any).__test__.parseAgentDefinition(

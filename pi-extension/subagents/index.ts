@@ -3125,19 +3125,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // allowlist, so a restricted subagent process sees only its permitted
   // agents. Mutating event.systemPromptOptions.sections is the documented
   // pattern: Pi diffs sections and patches only what changed, so an unchanged
-  // roster keeps the provider's cached prefix. Never return systemPrompt here:
-  // that replaces the whole prompt for the run and breaks caching.
+  // roster keeps the provider's cached prefix.
+  //
+  // Exception: when an earlier extension already forced the whole prompt
+  // (options.forceSystemPrompt set), buildSystemPromptState returns only the
+  // forced content and section writes never reach the provider. In that case
+  // append the roster to the forced prompt and return it, so the text
+  // survives. Never both: a forced turn returns the prompt and writes no
+  // section, an unforced turn writes the section and returns nothing.
   pi.on("before_agent_start", (event) => {
     try {
       const roster = discoverAgentDefinitions().filter((a) => !a.disableModelInvocation);
       if (roster.length === 0) return;
       // sections exists on Pi >= 1.5 systemPromptOptions; the 0.85 types this
       // repo compiles against predate it, hence the narrow cast. On a runtime
-      // without sections there is nothing to set, so skip silently.
-      const sections = (event.systemPromptOptions as { sections?: Record<string, string> })
-        .sections;
+      // without systemPromptOptions there is nothing to set, so skip silently.
+      const options = event.systemPromptOptions as {
+        sections?: Record<string, string>;
+        forceSystemPrompt?: string;
+      };
+      if (!options) return;
+      const text = renderAgentRoster(roster);
+      if (options.forceSystemPrompt !== undefined) {
+        return {
+          systemPrompt:
+            event.systemPrompt + "\n\n<available-agents>\n" + text + "\n</available-agents>",
+        };
+      }
+      const sections = options.sections;
       if (!sections) return;
-      sections["available-agents"] = renderAgentRoster(roster);
+      sections["available-agents"] = text;
     } catch {
       // A discovery error must never break the turn: skip the section.
     }
