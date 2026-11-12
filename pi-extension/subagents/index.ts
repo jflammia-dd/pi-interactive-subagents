@@ -365,14 +365,15 @@ function getToolExtensionSpecifiers(tool: string): string[] {
 /**
  * When this process was spawned as a restricted subagent, the parent pins the
  * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
+ * restriction (top-level session, or an unrestricted child). Read per call so
+ * the roster reflects the live env (production sets it once at spawn).
  */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
+function getSubagentAllowlist(): Set<string> | null {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
   if (!raw) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
-})();
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -380,7 +381,22 @@ function getBundledAgentsDir(): string {
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
   const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
+  const raw = match ? match[1].trim() : undefined;
+  if (raw === undefined) return raw;
+  // Agent descriptions are YAML double-quoted single-line values (they carry
+  // 'Not for X: use Y.' clauses, and a colon followed by a space is not valid
+  // in an unquoted YAML scalar). Strip exactly one matching pair of
+  // surrounding quotes so the roster shows the value, not the YAML syntax.
+  // Double-quoted: also unescape \" and \\ per YAML. Single-quoted: YAML
+  // doubles '' for a literal quote; leave the interior untouched. A lone
+  // quote byte stays byte-identical.
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    return raw.slice(1, -1).replace(/\\(["\\])/g, "$1");
+  }
+  if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
+    return raw.slice(1, -1);
+  }
+  return raw;
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -501,7 +517,26 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   // When this process is itself a restricted subagent, only expose the agents
   // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
   const all = [...agents.values()];
-  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+  const allowlist = getSubagentAllowlist();
+  return allowlist ? all.filter((a) => allowlist.has(a.name)) : all;
+}
+
+/** Header sentence of the available-agents system prompt section. */
+const AGENT_ROSTER_HEADER =
+  "These are the subagents the subagent and subagent_parallel tools accept, chosen by task shape without the user naming them.";
+
+/**
+ * Render the agent roster for the available-agents system prompt section.
+ * Deterministic: plain code-unit sort by name, one line per agent, so the
+ * output is byte-identical across turns when no agent file changed (which
+ * keeps Pi's prompt-section diff, and so the provider cache prefix, empty).
+ */
+function renderAgentRoster(agents: ListedAgentDefinition[]): string {
+  const lines = agents
+    .slice()
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    .map((a) => `- ${a.name}: ${a.description ?? "(no description)"}`);
+  return `${AGENT_ROSTER_HEADER}\n${lines.join("\n")}`;
 }
 
 function resolveSubagentPaths(
@@ -3082,6 +3117,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runningSubagents.clear();
   });
 
+  // ── available-agents roster section ──
+  // The model otherwise learns which agents exist only from hand-written
+  // AGENTS.md lines, which go stale. Render the live roster into a structured
+  // prompt section every turn: discoverAgentDefinitions() already honors
+  // bundled > global > project precedence and the PI_SUBAGENT_ALLOWED
+  // allowlist, so a restricted subagent process sees only its permitted
+  // agents. Mutating event.systemPromptOptions.sections is the documented
+  // pattern: Pi diffs sections and patches only what changed, so an unchanged
+  // roster keeps the provider's cached prefix. Never return systemPrompt here:
+  // that replaces the whole prompt for the run and breaks caching.
+  pi.on("before_agent_start", (event) => {
+    try {
+      const roster = discoverAgentDefinitions().filter((a) => !a.disableModelInvocation);
+      if (roster.length === 0) return;
+      // sections exists on Pi >= 1.5 systemPromptOptions; the 0.85 types this
+      // repo compiles against predate it, hence the narrow cast. On a runtime
+      // without sections there is nothing to set, so skip silently.
+      const sections = (event.systemPromptOptions as { sections?: Record<string, string> })
+        .sections;
+      if (!sections) return;
+      sections["available-agents"] = renderAgentRoster(roster);
+    } catch {
+      // A discovery error must never break the turn: skip the section.
+    }
+  });
+
   // The spawning tools are always registered here. Whether a child process can
   // actually see/use them is governed by the parent's `--tools` allowlist and
   // by which extensions are loaded into the child (default-deny --no-extensions
@@ -3130,8 +3191,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
+        const allowlist = getSubagentAllowlist();
+        const permittedAgents = allowlist
+          ? [...allowlist]
           : discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
@@ -3155,12 +3217,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
+                  `${allowlist ? "in your allowlist" : "a known agent"}. ` +
                   `Available agents: ${permittedList}.`,
               },
             ],
             details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
+              error: allowlist ? "agent not in allowlist" : "unknown agent",
             },
           };
         }
@@ -3375,9 +3437,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. Only call this tool when the user explicitly asks to list, show, or enumerate available agents. Do not call it just because the word \"subagents\" appears in conversation.",
+        "The available-agents section of the system prompt already lists every agent and its description; call this tool when you need an agent's model pin or definition source, or the user asks to list agents.",
       promptSnippet:
-        "List all available subagent definitions. Only call this tool when the user explicitly asks to list, show, or enumerate available agents. Do not call it just because the word \"subagents\" appears in conversation.",
+        "The available-agents section of the system prompt already lists every agent and its description; call this tool when you need an agent's model pin or definition source, or the user asks to list agents.",
       parameters: Type.Object({}),
 
       async execute() {
@@ -3858,8 +3920,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Validate all agents first — fail the whole batch if any is unknown,
         // rather than spawning a partial set.
         const allAgentDefs = discoverAgentDefinitions();
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
+        const allowlist = getSubagentAllowlist();
+        const permittedAgents = allowlist
+          ? [...allowlist]
           : allAgentDefs.map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         for (const t of params.tasks) {
